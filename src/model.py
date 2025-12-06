@@ -5,6 +5,7 @@ from transformers import MobileViTForImageClassification, AutoImageProcessor
 from transformers.models.mobilevit.modeling_mobilevit import MobileViTAttention
 from PIL import Image
 import os
+import sys
 from pathlib import Path
 
 
@@ -83,14 +84,7 @@ def copy_head_weights(self_attn, output_layer, new_query, new_key, new_value, ne
 
 
 def prune_attention(model, prune_ratio=0.10):
-    """
-    Prune attention heads based on L1 norm of query/key/value weights.
-    Preserves the weights of the remaining heads.
-
-    Args:
-        model: MobileViT model to prune
-        prune_ratio: Ratio of heads to prune (default: 0.10 = 10%)
-    """
+    """Prune attention heads in MobileViT model based on importance scores."""
     for name, module in model.named_modules():
         if not isinstance(module, MobileViTAttention):
             continue
@@ -142,6 +136,45 @@ def prune_attention(model, prune_ratio=0.10):
         self_attn.all_head_size = new_all_head_size
 
         print(f"Pruned {num_prune} heads from {name}, new head count: {new_num_heads}")
+
+    
+def prune_attn_w_column(model, prune_ratio=0.10):
+
+    for name, module in model.named_modules():
+        if not isinstance(module, MobileViTAttention):
+            continue
+
+        # get projection matrices of q, k, v
+        q_weight = module.attention.query.weight.data
+        k_weight = module.attention.key.weight.data
+        v_weight = module.attention.value.weight.data
+
+        # estimate column-wise importance using L1 norms
+        def estimate_col_importance(weight):
+            return torch.sum(torch.abs(weight), dim=0)
+
+        q_importance = estimate_col_importance(q_weight)
+        k_importance = estimate_col_importance(k_weight)
+        v_importance = estimate_col_importance(v_weight)
+
+        # sparse the columns based on importance scores by zeroing them out
+        def sparse_weights(weight, importance, prune_ratio):
+            num_cols = weight.size(1)
+            num_prune = int(prune_ratio * num_cols)
+            if num_prune == 0:
+                return weight  # No pruning needed
+
+            # Find columns to prune (lowest importance)
+            prune_indices = torch.topk(importance, num_prune, largest=False).indices
+            # Zero out the pruned columns instead of removing them
+            weight[:, prune_indices] = 0
+            return weight
+
+        module.attention.query.weight.data = sparse_weights(q_weight, q_importance, prune_ratio)
+        module.attention.key.weight.data = sparse_weights(k_weight, k_importance, prune_ratio)
+        module.attention.value.weight.data = sparse_weights(v_weight, v_importance, prune_ratio)
+
+        print(f"Sparsified {name}: zeroed out {int(prune_ratio * q_weight.size(1))} columns ({prune_ratio * 100:.0f}%)")    
 
 class ImageNetMiniDataset(Dataset):
     """Custom dataset for local ImageNet mini folder structure"""
@@ -259,8 +292,16 @@ def load_model_and_data(use_local=True, local_path="~/archive/imagenet-mini/val"
 
 def main():
     """Main function to evaluate baseline and pruned model."""
+
+    args = sys.argv[1] if len(sys.argv) > 1 else ""
+    print(args)
+    prun_head = False
+    if args == "--head-prune":
+        prun_head = True
+
     # Load model and data
     model, val_dataloader, device = load_model_and_data(use_local=True)
+
 
     # Evaluate baseline
     print("\n" + "="*50)
@@ -269,19 +310,34 @@ def main():
     baseline_accuracy = evaluate_model(model, val_dataloader, device)
     print(f"\nBaseline Accuracy: {baseline_accuracy * 100:.2f}%")
 
-    # Prune model
-    print("\n" + "="*50)
-    print("Starting Attention Head Pruning...")
-    print("="*50)
-    prune_attention(model, prune_ratio=0.75)
+    if (prun_head):
+        # Prune model
+        print("\n" + "="*50)
+        print("Starting Attention Head Pruning...")
+        print("="*50)
+        prune_attention(model, prune_ratio=0.75)
 
-    # Evaluate pruned model
-    print("\n" + "="*50)
-    print("Evaluating Pruned Model...")
-    print("="*50)
-    pruned_accuracy = evaluate_model(model, val_dataloader, device)
-    print(f"\nPruned Model Accuracy: {pruned_accuracy * 100:.2f}%")
-    print(f"Accuracy Drop: {(baseline_accuracy - pruned_accuracy) * 100:.2f}%")
+        # Evaluate pruned model
+        print("\n" + "="*50)
+        print("Evaluating Pruned Model...")
+        print("="*50)
+        pruned_accuracy = evaluate_model(model, val_dataloader, device)
+        print(f"\nPruned Model Accuracy: {pruned_accuracy * 100:.2f}%")
+        print(f"Accuracy Drop: {(baseline_accuracy - pruned_accuracy) * 100:.2f}%")
+    else:
+        # Prune model with column pruning
+        print("\n" + "="*50)
+        print("Starting Attention Column Pruning...")
+        print("="*50)
+        prune_attn_w_column(model, prune_ratio=0.25)
+
+        # Evaluate pruned model
+        print("\n" + "="*50)
+        print("Evaluating Pruned Model...")
+        print("="*50)
+        pruned_accuracy = evaluate_model(model, val_dataloader, device)
+        print(f"\nPruned Model Accuracy: {pruned_accuracy * 100:.2f}%")
+        print(f"Accuracy Drop: {(baseline_accuracy - pruned_accuracy) * 100:.2f}%")
 
 
 if __name__ == "__main__":
