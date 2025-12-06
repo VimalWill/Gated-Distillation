@@ -7,6 +7,8 @@ from PIL import Image
 import os
 import sys
 from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def calculate_head_importance(self_attn, num_heads, head_dim):
@@ -256,6 +258,65 @@ def evaluate_model(model, dataloader, device):
     return accuracy
 
 
+def plot_ieee_results(exp_outcome, baseline_accuracy, save_path="pruning_results.pdf"):
+    """Plot experimental results in IEEE standard format."""
+    # Set IEEE style parameters
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = ['Times New Roman']
+    plt.rcParams['font.size'] = 10
+    plt.rcParams['axes.labelsize'] = 10
+    plt.rcParams['axes.titlesize'] = 10
+    plt.rcParams['xtick.labelsize'] = 9
+    plt.rcParams['ytick.labelsize'] = 9
+    plt.rcParams['legend.fontsize'] = 9
+    plt.rcParams['figure.titlesize'] = 11
+
+    # IEEE standard figure size (column width: 3.5 inches, two-column: 7.16 inches)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.16, 2.5))
+
+    # Extract data
+    prune_ratios = [item['prune_ratio'] * 100 for item in exp_outcome]
+    accuracies = [item['accuracy'] * 100 for item in exp_outcome]
+    accuracy_drops = [(baseline_accuracy - item['accuracy']) * 100 for item in exp_outcome]
+
+    # Plot 1: Accuracy vs Pruning Ratio
+    ax1.plot(prune_ratios, accuracies, marker='o', linewidth=1.5,
+             markersize=5, color='#0173B2', label='Pruned Model')
+    ax1.axhline(y=baseline_accuracy * 100, color='#DE8F05',
+                linestyle='--', linewidth=1.5, label='Baseline')
+    ax1.set_xlabel('Pruning Ratio (%)')
+    ax1.set_ylabel('Accuracy (%)')
+    ax1.set_title('Model Accuracy vs. Pruning Ratio')
+    ax1.grid(True, linestyle=':', alpha=0.6, linewidth=0.5)
+    ax1.legend(loc='best', frameon=True, edgecolor='black', fancybox=False)
+    ax1.set_xlim(left=0)
+
+    # Plot 2: Accuracy Drop vs Pruning Ratio
+    ax2.plot(prune_ratios, accuracy_drops, marker='s', linewidth=1.5,
+             markersize=5, color='#CC3311', label='Accuracy Drop')
+    ax2.set_xlabel('Pruning Ratio (%)')
+    ax2.set_ylabel('Accuracy Drop (%)')
+    ax2.set_title('Accuracy Degradation vs. Pruning Ratio')
+    ax2.grid(True, linestyle=':', alpha=0.6, linewidth=0.5)
+    ax2.legend(loc='best', frameon=True, edgecolor='black', fancybox=False)
+    ax2.set_xlim(left=0)
+    ax2.set_ylim(bottom=0)
+
+    # Adjust layout to prevent overlap
+    plt.tight_layout()
+
+    # Save as PDF (IEEE preferred format)
+    plt.savefig(save_path, format='pdf', dpi=300, bbox_inches='tight')
+    print(f"\nPlot saved to: {save_path}")
+
+    # Also save as PNG for quick viewing
+    png_path = save_path.replace('.pdf', '.png')
+    plt.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
+    print(f"Plot saved to: {png_path}")
+
+    plt.close()
+
+
 def load_model_and_data(use_local=True, local_path="~/archive/imagenet-mini/val"):
     """Load MobileViT model and dataset."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -315,29 +376,51 @@ def main():
         print("\n" + "="*50)
         print("Starting Attention Head Pruning...")
         print("="*50)
-        prune_attention(model, prune_ratio=0.75)
 
-        # Evaluate pruned model
+        exp_outcome = []
+        for i in range(1, 16):
+            print(f"\n--- Pruning {i*5}% of heads ---")
+            prune_attention(model, prune_ratio=i*0.05)
+
+            # Evaluate pruned model
+            print("\n" + "="*50)
+            print("Evaluating Pruned Model...")
+            print("="*50)
+            pruned_accuracy = evaluate_model(model, val_dataloader, device)
+            exp_outcome.append({"prune_ratio": i*0.05, "accuracy": pruned_accuracy})
+            print(f"\nPruned Model Accuracy: {pruned_accuracy * 100:.2f}%")
+            print(f"Accuracy Drop: {(baseline_accuracy - pruned_accuracy) * 100:.2f}%")
+
+        # Plot results in IEEE format
         print("\n" + "="*50)
-        print("Evaluating Pruned Model...")
+        print("Generating IEEE Standard Plots...")
         print("="*50)
-        pruned_accuracy = evaluate_model(model, val_dataloader, device)
-        print(f"\nPruned Model Accuracy: {pruned_accuracy * 100:.2f}%")
-        print(f"Accuracy Drop: {(baseline_accuracy - pruned_accuracy) * 100:.2f}%")
+        plot_ieee_results(exp_outcome, baseline_accuracy, save_path="head_pruning_results.pdf")
     else:
         # Prune model with column pruning
         print("\n" + "="*50)
         print("Starting Attention Column Pruning...")
         print("="*50)
-        prune_attn_w_column(model, prune_ratio=0.25)
 
-        # Evaluate pruned model
+        exp_outcome = []
+        for i in range(1, 11):
+            print(f"\n--- Pruning {i*10}% of columns ---")
+            prune_attn_w_column(model, prune_ratio=i*0.1)
+
+            # Evaluate pruned model
+            print("\n" + "="*50)
+            print("Evaluating Pruned Model...")
+            print("="*50)
+            pruned_accuracy = evaluate_model(model, val_dataloader, device)
+            exp_outcome.append({"prune_ratio": i*0.1, "accuracy": pruned_accuracy})
+            print(f"\nPruned Model Accuracy: {pruned_accuracy * 100:.2f}%")
+            print(f"Accuracy Drop: {(baseline_accuracy - pruned_accuracy) * 100:.2f}%")
+
+        # Plot results in IEEE format
         print("\n" + "="*50)
-        print("Evaluating Pruned Model...")
+        print("Generating IEEE Standard Plots...")
         print("="*50)
-        pruned_accuracy = evaluate_model(model, val_dataloader, device)
-        print(f"\nPruned Model Accuracy: {pruned_accuracy * 100:.2f}%")
-        print(f"Accuracy Drop: {(baseline_accuracy - pruned_accuracy) * 100:.2f}%")
+        plot_ieee_results(exp_outcome, baseline_accuracy)
 
 
 if __name__ == "__main__":
