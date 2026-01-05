@@ -351,18 +351,204 @@ def load_model_and_data(use_local=True, local_path="~/archive/imagenet-mini/val"
     return model, val_dataloader, device
 
 
+def get_magnitude_and_cosine_similarity(tensor_a, tensor_b):
+    """Compute cosine similarity and magnitude denominator between two tensors.
+
+    Formula: cosine_sim = (tensor_a · tensor_b) / (||tensor_a|| * ||tensor_b||)
+
+    Args:
+        tensor_a: First tensor of shape [num_samples, hidden_dim]
+        tensor_b: Second tensor of shape [num_samples, hidden_dim]
+
+    Returns:
+        tuple: (cosine_similarity, magnitude_denominator)
+            - cosine_similarity: The similarity values
+            - magnitude_denominator: ||tensor_a|| * ||tensor_b||
+    """
+    # Compute dot product (numerator)
+    dot_product = torch.sum(tensor_a * tensor_b, dim=1)
+
+    # Compute magnitudes (L2 norms)
+    magnitude_a = torch.norm(tensor_a, p=2, dim=1)
+    magnitude_b = torch.norm(tensor_b, p=2, dim=1)
+
+    # Compute denominator
+    magnitude_denominator = magnitude_a * magnitude_b
+
+    # Compute cosine similarity
+    # Add small epsilon to avoid division by zero
+    cosine_similarity = dot_product / (magnitude_denominator + 1e-8)
+
+    return cosine_similarity, magnitude_denominator
+
+
+def get_input_output_similarity(model, dataloader, device, num_batches=10):
+    """Compute input-output cosine similarity for transformer layers.
+
+    Args:
+        model: The model to analyze
+        dataloader: DataLoader for the dataset
+        device: Device to run on
+        num_batches: Number of batches to process (default: 10)
+
+    Returns:
+        Dictionary mapping layer names to similarity scores
+    """
+    # Dictionary to store input/output pairs
+    layer_data = {}
+    hooks = []
+
+    def create_hook(layer_name):
+        """Create a hook that captures input and output."""
+        def hook(module, input, output):
+            if layer_name not in layer_data:
+                layer_data[layer_name] = {'inputs': [], 'outputs': []}
+            # Store detached copies on CPU to save memory
+            layer_data[layer_name]['inputs'].append(input[0].detach().cpu())
+            layer_data[layer_name]['outputs'].append(output.detach().cpu())
+        return hook
+
+    # Register hooks for MobileViT transformer layers
+    for name, module in model.named_modules():
+        # MobileViT uses MobileViTTransformerLayer
+        if 'transformer.layer.' in name and not '.' in name.split('transformer.layer.')[1]:
+            hook = module.register_forward_hook(create_hook(name))
+            hooks.append(hook)
+
+    print(f"Registered {len(hooks)} hooks for transformer layers")
+
+    # Run inference to collect data
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= num_batches:
+                break
+
+            pixel_values = batch['pixel_values'].to(device)
+            _ = model(pixel_values=pixel_values)
+
+            if (batch_idx + 1) % 5 == 0:
+                print(f"Processed {batch_idx + 1}/{num_batches} batches...")
+
+    # Remove hooks
+    for hook in hooks:
+        hook.remove()
+
+    # Compute similarities and magnitudes
+    similarities = {}
+    magnitudes = {}
+    print("\n" + "="*50)
+    print("Computing Cosine Similarities and Magnitudes...")
+    print("="*50)
+
+    for layer_name in sorted(layer_data.keys()):
+        inputs = torch.cat(layer_data[layer_name]['inputs'], dim=0)  # Concatenate all batches
+        outputs = torch.cat(layer_data[layer_name]['outputs'], dim=0)
+
+        # Flatten to [num_samples, hidden_dim]
+        inputs_flat = inputs.reshape(-1, inputs.size(-1))
+        outputs_flat = outputs.reshape(-1, outputs.size(-1))
+
+        # Compute cosine similarity and magnitude denominator
+        cos_sim, mag_denom = get_magnitude_and_cosine_similarity(inputs_flat, outputs_flat)
+
+        avg_similarity = cos_sim.mean().item()
+        avg_magnitude = mag_denom.mean().item()
+
+        similarities[layer_name] = avg_similarity
+        magnitudes[layer_name] = avg_magnitude
+
+        print(f"{layer_name}: Similarity={avg_similarity:.4f}, Magnitude={avg_magnitude:.2f}")
+
+    return similarities, magnitudes
+
+
 def main():
     """Main function to evaluate baseline and pruned model."""
 
     args = sys.argv[1] if len(sys.argv) > 1 else ""
     print(args)
+
+    # Parse arguments
     prun_head = False
+    analyze_similarity = False
+
     if args == "--head-prune":
         prun_head = True
+    elif args == "--similarity":
+        analyze_similarity = True
 
     # Load model and data
     model, val_dataloader, device = load_model_and_data(use_local=True)
 
+    # If similarity analysis mode is requested
+    if analyze_similarity:
+        print("\n" + "="*50)
+        print("Layer Similarity Analysis Mode")
+        print("="*50)
+
+        # Analyze baseline model
+        print("\n--- Baseline Model ---")
+        baseline_sim, baseline_mag = get_input_output_similarity(model, val_dataloader, device, num_batches=10)
+
+        # Plot the results
+        print("\n" + "="*50)
+        print("Generating Plots...")
+        print("="*50)
+
+        # Set IEEE style parameters
+        plt.rcParams['font.family'] = 'serif'
+        plt.rcParams['font.serif'] = ['Times New Roman']
+        plt.rcParams['font.size'] = 10
+        plt.rcParams['axes.labelsize'] = 10
+        plt.rcParams['axes.titlesize'] = 10
+        plt.rcParams['xtick.labelsize'] = 9
+        plt.rcParams['ytick.labelsize'] = 9
+        plt.rcParams['legend.fontsize'] = 9
+        plt.rcParams['figure.titlesize'] = 11
+
+        # Extract layer indices
+        layer_names = sorted(baseline_sim.keys())
+        layer_indices = list(range(len(layer_names)))
+        sim_values = [baseline_sim[name] for name in layer_names]
+        mag_values = [baseline_mag[name] for name in layer_names]
+
+        # Create two-plot figure (IEEE two-column width)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.16, 2.5))
+
+        # Plot 1: Cosine Similarity
+        ax1.plot(layer_indices, sim_values, marker='o', linewidth=1.5,
+                markersize=5, color='#0173B2', label='Cosine Similarity')
+        ax1.set_xlabel('Layer Index')
+        ax1.set_ylabel('Similarity')
+        ax1.set_title('Input-Output Cosine Similarity')
+        ax1.set_xticks(layer_indices)
+        ax1.set_ylim([0, 1.0])
+        ax1.set_xlim(left=0)
+        ax1.grid(True, linestyle=':', alpha=0.6, linewidth=0.5)
+        ax1.legend(loc='best', frameon=True, edgecolor='black', fancybox=False)
+
+        # Plot 2: Magnitude Denominator
+        ax2.plot(layer_indices, mag_values, marker='s', linewidth=1.5,
+                markersize=5, color='#CC3311', label='Magnitude')
+        ax2.set_xlabel('Layer Index')
+        ax2.set_ylabel('Magnitude')
+        ax2.set_title('Magnitude Denominator')
+        ax2.set_xticks(layer_indices)
+        ax2.set_xlim(left=0)
+        ax2.grid(True, linestyle=':', alpha=0.6, linewidth=0.5)
+        ax2.legend(loc='best', frameon=True, edgecolor='black', fancybox=False)
+
+        plt.tight_layout()
+
+        # Save as PNG
+        save_path = 'baseline_layer_similarities.png'
+        plt.savefig(save_path, format='png', dpi=300, bbox_inches='tight')
+        print(f"\nPlot saved to: {save_path}")
+
+        plt.close()
+
+        return
 
     # Evaluate baseline
     print("\n" + "="*50)
