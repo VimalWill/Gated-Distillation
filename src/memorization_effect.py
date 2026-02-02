@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 import torch.nn.functional as F
@@ -43,23 +44,34 @@ def estimate_memorization(model, dataset, tokenizer):
         scores.append(score)
         labels.append(ex["label"])
 
+    # ROC-AUC
     auc = roc_auc_score(labels, scores)
+
+    # Min-K% scores split by member/non-member
+    member_scores = [s for s, l in zip(scores, labels) if l == 1]
+    nonmember_scores = [s for s, l in zip(scores, labels) if l == 0]
+    mink_member = np.mean(member_scores)
+    mink_nonmember = np.mean(nonmember_scores)
+    mink_gap = mink_member - mink_nonmember
+
     print(f"ROC-AUC: {auc:.4f}")
+    print(f"Min-K% member:     {mink_member:.4f}")
+    print(f"Min-K% non-member: {mink_nonmember:.4f}")
+    print(f"Min-K% gap:        {mink_gap:.4f}")
     print(f"Total samples: {len(labels)}")
     print(f"Memorized (label=1): {sum(labels)}")
     print(f"Non-memorized (label=0): {len(labels) - sum(labels)}")
 
-    return auc
+    return {
+        'auc': auc,
+        'mink_member': mink_member,
+        'mink_nonmember': mink_nonmember,
+        'mink_gap': mink_gap,
+    }
 
 
-def plot_pruning_vs_auc(results, save_path="memorization_pruning_results.png"):
-    """Plot pruning ratio vs ROC-AUC in IEEE standard format.
-
-    Args:
-        results: List of dicts with 'prune_ratio' and 'auc' keys
-        save_path: Path to save the plot
-    """
-    # Set IEEE style parameters
+def plot_pruning_vs_memorization(results, save_path="memorization_pruning_results.png"):
+    """Plot ROC-AUC and Min-K% Gap on single plot with dual y-axes."""
     plt.rcParams['font.family'] = 'serif'
     plt.rcParams['font.serif'] = ['Times New Roman']
     plt.rcParams['font.size'] = 10
@@ -70,39 +82,43 @@ def plot_pruning_vs_auc(results, save_path="memorization_pruning_results.png"):
     plt.rcParams['legend.fontsize'] = 9
     plt.rcParams['figure.titlesize'] = 11
 
-    # Create figure (IEEE two-column width)
-    fig, ax = plt.subplots(figsize=(7.16, 2.5))
+    fig, ax1 = plt.subplots(figsize=(7.16, 3.5))
 
-    # Extract data
     prune_ratios = [r['prune_ratio'] * 100 for r in results]
     auc_scores = [r['auc'] for r in results]
+    mink_gap = [r['mink_gap'] for r in results]
 
-    # Plot
-    ax.plot(prune_ratios, auc_scores, marker='o', linewidth=1.5,
-            markersize=5, color='#0173B2', label='ROC-AUC Score')
+    # Left y-axis: ROC-AUC
+    color_auc = '#0173B2'
+    ax1.plot(prune_ratios, auc_scores, marker='o', linewidth=1.5,
+             markersize=5, color=color_auc, label='ROC-AUC')
+    ax1.set_xlabel('Pruning Ratio (%)')
+    ax1.set_ylabel('ROC-AUC Score', color=color_auc)
+    ax1.tick_params(axis='y', labelcolor=color_auc)
+    ax1.set_xlim(left=0)
+    ax1.set_ylim([0.4, 1.0])
+    ax1.grid(True, linestyle=':', alpha=0.6, linewidth=0.5)
 
-    # Add horizontal line at baseline AUC
-    if len(results) > 0:
-        baseline_auc = results[0]['auc']
-        ax.axhline(y=baseline_auc, color='#DE8F05',
-                   linestyle='--', linewidth=1.5, label='Baseline')
+    # Right y-axis: Min-K% Gap
+    ax2 = ax1.twinx()
+    color_gap = '#D55E00'
+    ax2.plot(prune_ratios, mink_gap, marker='^', linewidth=1.5,
+             markersize=5, color=color_gap, linestyle='--', label='Min-K% Gap')
+    ax2.set_ylabel('Min-K% Gap (member - non-member)', color=color_gap)
+    ax2.tick_params(axis='y', labelcolor=color_gap)
 
-    # Customize plot
-    ax.set_xlabel('Pruning Ratio (%)')
-    ax.set_ylabel('ROC-AUC Score')
-    ax.set_title('Memorization Detection (ROC-AUC) vs. Pruning Ratio')
-    ax.grid(True, linestyle=':', alpha=0.6, linewidth=0.5)
-    ax.legend(loc='best', frameon=True, edgecolor='black', fancybox=False)
-    ax.set_xlim(left=0)
-    ax.set_ylim([0, 1.0])
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='best',
+               frameon=True, edgecolor='black', fancybox=False)
 
+    ax1.set_title('Memorization Detection vs. Pruning Ratio')
     plt.tight_layout()
 
-    # Save as PNG
     plt.savefig(save_path, format='png', dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to: {save_path}")
 
-    # Also save as PDF
     pdf_path = save_path.replace('.png', '.pdf')
     plt.savefig(pdf_path, format='pdf', dpi=300, bbox_inches='tight')
     print(f"Plot saved to: {pdf_path}")
@@ -115,12 +131,15 @@ def main():
 
     model_name = "EleutherAI/pythia-2.8b"
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        device_map="auto"
+        dtype=torch.float16,
     )
+    model = model.to(device)
     model.eval()
 
     # Store results for plotting
@@ -129,8 +148,11 @@ def main():
     print("="*50)
     print("Baseline (No Pruning)")
     print("="*50)
-    baseline_auc = estimate_memorization(model, dataset, tokenizer)
-    results.append({'prune_ratio': 0.0, 'auc': baseline_auc})
+    baseline = estimate_memorization(model, dataset, tokenizer)
+    results.append({'prune_ratio': 0.0, **baseline})
+
+    del model
+    torch.cuda.empty_cache()
 
     # Test different pruning ratios
     prune_ratios = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -140,28 +162,39 @@ def main():
         print(f"Pruning Ratio: {prune_ratio*100:.0f}%")
         print("="*50)
 
+        # Reload fresh model for independent pruning
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.float16,
+        )
+        model = model.to(device)
+        model.eval()
+
         # Apply pruning
         prune_attn_w_column(model, prune_ratio=prune_ratio)
 
         # Evaluate memorization
-        auc = estimate_memorization(model, dataset, tokenizer)
-        results.append({'prune_ratio': prune_ratio, 'auc': auc})
+        metrics = estimate_memorization(model, dataset, tokenizer)
+        results.append({'prune_ratio': prune_ratio, **metrics})
+
+        del model
+        torch.cuda.empty_cache()
 
     # Plot results
     print("\n" + "="*50)
     print("Generating IEEE Standard Plot...")
     print("="*50)
-    plot_pruning_vs_auc(results, save_path="memorization_pruning_results.png")
+    plot_pruning_vs_memorization(results, save_path="memorization_pruning_results.png")
 
     # Print summary
     print("\n" + "="*50)
     print("Summary of Results")
     print("="*50)
-    print(f"{'Pruning Ratio':<15} {'ROC-AUC':<10} {'Change from Baseline':<20}")
-    print("-"*50)
+    print(f"{'Prune%':<8} {'ROC-AUC':<10} {'Δ AUC':<10} {'MinK Member':<13} {'MinK NonMem':<13} {'MinK Gap':<10}")
+    print("-"*64)
     for r in results:
-        change = r['auc'] - baseline_auc
-        print(f"{r['prune_ratio']*100:>5.0f}%          {r['auc']:.4f}     {change:+.4f}")
+        d_auc = r['auc'] - baseline['auc']
+        print(f"{r['prune_ratio']*100:>5.0f}%   {r['auc']:.4f}     {d_auc:+.4f}    {r['mink_member']:.4f}       {r['mink_nonmember']:.4f}       {r['mink_gap']:.4f}")
 
 
 if __name__ == "__main__":

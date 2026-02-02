@@ -1,8 +1,11 @@
 """
-Layer-wise Pruning Analysis: ROC-AUC (Memorization) and Accuracy per Layer.
+Layer-wise Pruning Analysis: ROC-AUC, Min-K% (Memorization) and Accuracy per Layer.
 
 This script prunes each layer individually at different ratios (10%, 15%, 20%)
-and measures both memorization detection (ROC-AUC) and task accuracy.
+and measures memorization detection (ROC-AUC + Min-K% scores) and task accuracy.
+
+Min-K% method reference: Shi et al., "Detecting Pretraining Data from Large
+Language Models" (arXiv:2310.16789, ICLR 2024)
 """
 
 import torch
@@ -93,14 +96,22 @@ def min_k_percent_score(token_log_probs, k=0.2):
     return lowest.mean().item()
 
 
-def calculate_roc_auc(model, tokenizer, dataset, max_samples=200):
-    """Calculate ROC-AUC for memorization detection."""
+def calculate_memorization_metrics(model, tokenizer, dataset, max_samples=200):
+    """Calculate ROC-AUC and Min-K% scores for memorization detection.
+
+    Returns:
+        dict with keys:
+            'roc_auc': ROC-AUC score
+            'mink_member': Mean Min-K% score for member samples (label=1)
+            'mink_nonmember': Mean Min-K% score for non-member samples (label=0)
+            'mink_gap': Gap between member and non-member scores
+    """
     model.eval()
     scores = []
     labels = []
 
     with torch.no_grad():
-        for idx, ex in enumerate(tqdm(dataset, desc="Calculating ROC-AUC", leave=False)):
+        for idx, ex in enumerate(tqdm(dataset, desc="Calculating memorization metrics", leave=False)):
             if idx >= max_samples:
                 break
             log_probs = get_token_logprobs(ex["input"], tokenizer, model)
@@ -108,11 +119,24 @@ def calculate_roc_auc(model, tokenizer, dataset, max_samples=200):
             scores.append(score)
             labels.append(ex["label"])
 
-    if len(set(labels)) < 2:
-        return 0.5  # Can't compute AUC with single class
+    # Separate member vs non-member scores
+    member_scores = [s for s, l in zip(scores, labels) if l == 1]
+    nonmember_scores = [s for s, l in zip(scores, labels) if l == 0]
 
-    auc = roc_auc_score(labels, scores)
-    return auc
+    mean_member = np.mean(member_scores) if member_scores else 0.0
+    mean_nonmember = np.mean(nonmember_scores) if nonmember_scores else 0.0
+
+    if len(set(labels)) < 2:
+        auc = 0.5
+    else:
+        auc = roc_auc_score(labels, scores)
+
+    return {
+        'roc_auc': auc,
+        'mink_member': mean_member,
+        'mink_nonmember': mean_nonmember,
+        'mink_gap': mean_member - mean_nonmember,
+    }
 
 
 def calculate_accuracy(model, tokenizer, dataset, max_samples=200):
@@ -148,13 +172,13 @@ def calculate_accuracy(model, tokenizer, dataset, max_samples=200):
 
 
 def plot_layer_analysis(results, save_path="layer_analysis.png"):
-    """Plot ROC-AUC and Accuracy vs Layer for different pruning ratios."""
+    """Plot ROC-AUC, Min-K% Gap, and Accuracy vs Layer for different pruning ratios."""
 
     plt.rcParams['font.family'] = 'serif'
     plt.rcParams['font.serif'] = ['Times New Roman']
     plt.rcParams['font.size'] = 10
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     # Colors for different pruning ratios
     colors = {'10': '#0173B2', '15': '#DE8F05', '20': '#029E73'}
@@ -164,7 +188,7 @@ def plot_layer_analysis(results, save_path="layer_analysis.png"):
     layers = sorted(set(r['layer'] for r in results))
     prune_ratios = sorted(set(r['prune_ratio'] for r in results))
 
-    # Plot ROC-AUC
+    # --- Panel 1: ROC-AUC ---
     ax1 = axes[0]
     for pr in prune_ratios:
         pr_results = [r for r in results if r['prune_ratio'] == pr]
@@ -175,38 +199,56 @@ def plot_layer_analysis(results, save_path="layer_analysis.png"):
                  linewidth=1.5, markersize=5, color=colors[str(int(pr*100))],
                  label=f'{int(pr*100)}% pruning')
 
-    # Add baseline
     baseline_auc = results[0].get('baseline_auc', 0.5)
     ax1.axhline(y=baseline_auc, color='gray', linestyle='--', linewidth=1.5, label='Baseline')
 
     ax1.set_xlabel('Layer Index')
     ax1.set_ylabel('ROC-AUC Score')
-    ax1.set_title('Memorization Detection (ROC-AUC) per Layer')
+    ax1.set_title('(a) Memorization Detection (ROC-AUC)')
     ax1.grid(True, linestyle=':', alpha=0.6)
-    ax1.legend(loc='best')
+    ax1.legend(loc='best', fontsize=8)
     ax1.set_ylim([0.4, 1.0])
 
-    # Plot Accuracy
+    # --- Panel 2: Min-K% Gap (member - non-member) ---
     ax2 = axes[1]
     for pr in prune_ratios:
         pr_results = [r for r in results if r['prune_ratio'] == pr]
         pr_results.sort(key=lambda x: x['layer'])
         layer_vals = [r['layer'] for r in pr_results]
-        acc_vals = [r['accuracy'] * 100 for r in pr_results]
-        ax2.plot(layer_vals, acc_vals, marker=markers[str(int(pr*100))],
+        gap_vals = [r['mink_gap'] for r in pr_results]
+        ax2.plot(layer_vals, gap_vals, marker=markers[str(int(pr*100))],
                  linewidth=1.5, markersize=5, color=colors[str(int(pr*100))],
                  label=f'{int(pr*100)}% pruning')
 
-    # Add baseline
-    baseline_acc = results[0].get('baseline_acc', 0.5) * 100
-    ax2.axhline(y=baseline_acc, color='gray', linestyle='--', linewidth=1.5, label='Baseline')
+    baseline_gap = results[0].get('baseline_mink_gap', 0.0)
+    ax2.axhline(y=baseline_gap, color='gray', linestyle='--', linewidth=1.5, label='Baseline')
 
     ax2.set_xlabel('Layer Index')
-    ax2.set_ylabel('Accuracy (%)')
-    ax2.set_title('LAMBADA Accuracy per Layer')
+    ax2.set_ylabel('Min-K% Score Gap\n(member - non-member)')
+    ax2.set_title('(b) Min-K% Memorization Signal')
     ax2.grid(True, linestyle=':', alpha=0.6)
-    ax2.legend(loc='best')
-    ax2.set_ylim([0, 100])
+    ax2.legend(loc='best', fontsize=8)
+
+    # --- Panel 3: Accuracy ---
+    ax3 = axes[2]
+    for pr in prune_ratios:
+        pr_results = [r for r in results if r['prune_ratio'] == pr]
+        pr_results.sort(key=lambda x: x['layer'])
+        layer_vals = [r['layer'] for r in pr_results]
+        acc_vals = [r['accuracy'] * 100 for r in pr_results]
+        ax3.plot(layer_vals, acc_vals, marker=markers[str(int(pr*100))],
+                 linewidth=1.5, markersize=5, color=colors[str(int(pr*100))],
+                 label=f'{int(pr*100)}% pruning')
+
+    baseline_acc = results[0].get('baseline_acc', 0.5) * 100
+    ax3.axhline(y=baseline_acc, color='gray', linestyle='--', linewidth=1.5, label='Baseline')
+
+    ax3.set_xlabel('Layer Index')
+    ax3.set_ylabel('Accuracy (%)')
+    ax3.set_title('(c) LAMBADA Accuracy')
+    ax3.grid(True, linestyle=':', alpha=0.6)
+    ax3.legend(loc='best', fontsize=8)
+    ax3.set_ylim([0, 100])
 
     plt.tight_layout()
 
@@ -222,12 +264,12 @@ def plot_layer_analysis(results, save_path="layer_analysis.png"):
 
 
 def plot_heatmap(results, save_path="layer_heatmap.png"):
-    """Plot heatmaps for ROC-AUC and Accuracy changes."""
+    """Plot heatmaps for ROC-AUC, Min-K% Gap, and Accuracy changes."""
 
     plt.rcParams['font.family'] = 'serif'
     plt.rcParams['font.size'] = 10
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
 
     # Get unique layers and prune ratios
     layers = sorted(set(r['layer'] for r in results))
@@ -235,38 +277,52 @@ def plot_heatmap(results, save_path="layer_heatmap.png"):
 
     baseline_auc = results[0].get('baseline_auc', 0.5)
     baseline_acc = results[0].get('baseline_acc', 0.5)
+    baseline_gap = results[0].get('baseline_mink_gap', 0.0)
 
     # Create matrices
     auc_matrix = np.zeros((len(prune_ratios), len(layers)))
+    gap_matrix = np.zeros((len(prune_ratios), len(layers)))
     acc_matrix = np.zeros((len(prune_ratios), len(layers)))
 
     for r in results:
         li = layers.index(r['layer'])
         pi = prune_ratios.index(r['prune_ratio'])
-        auc_matrix[pi, li] = r['roc_auc'] - baseline_auc  # Change from baseline
-        acc_matrix[pi, li] = (r['accuracy'] - baseline_acc) * 100  # Change from baseline
+        auc_matrix[pi, li] = r['roc_auc'] - baseline_auc
+        gap_matrix[pi, li] = r['mink_gap'] - baseline_gap
+        acc_matrix[pi, li] = (r['accuracy'] - baseline_acc) * 100
 
     # ROC-AUC heatmap
     im1 = axes[0].imshow(auc_matrix, cmap='RdYlGn', aspect='auto', vmin=-0.2, vmax=0.2)
     axes[0].set_xticks(range(len(layers)))
-    axes[0].set_xticklabels(layers)
+    axes[0].set_xticklabels(layers, fontsize=7)
     axes[0].set_yticks(range(len(prune_ratios)))
     axes[0].set_yticklabels([f'{int(p*100)}%' for p in prune_ratios])
     axes[0].set_xlabel('Layer Index')
     axes[0].set_ylabel('Pruning Ratio')
-    axes[0].set_title('ROC-AUC Change from Baseline')
+    axes[0].set_title('(a) ROC-AUC Change')
     plt.colorbar(im1, ax=axes[0])
 
-    # Accuracy heatmap
-    im2 = axes[1].imshow(acc_matrix, cmap='RdYlGn', aspect='auto', vmin=-30, vmax=10)
+    # Min-K% Gap heatmap
+    im2 = axes[1].imshow(gap_matrix, cmap='RdYlGn_r', aspect='auto')
     axes[1].set_xticks(range(len(layers)))
-    axes[1].set_xticklabels(layers)
+    axes[1].set_xticklabels(layers, fontsize=7)
     axes[1].set_yticks(range(len(prune_ratios)))
     axes[1].set_yticklabels([f'{int(p*100)}%' for p in prune_ratios])
     axes[1].set_xlabel('Layer Index')
     axes[1].set_ylabel('Pruning Ratio')
-    axes[1].set_title('Accuracy Change from Baseline (%)')
+    axes[1].set_title('(b) Min-K% Gap Change')
     plt.colorbar(im2, ax=axes[1])
+
+    # Accuracy heatmap
+    im3 = axes[2].imshow(acc_matrix, cmap='RdYlGn', aspect='auto', vmin=-30, vmax=10)
+    axes[2].set_xticks(range(len(layers)))
+    axes[2].set_xticklabels(layers, fontsize=7)
+    axes[2].set_yticks(range(len(prune_ratios)))
+    axes[2].set_yticklabels([f'{int(p*100)}%' for p in prune_ratios])
+    axes[2].set_xlabel('Layer Index')
+    axes[2].set_ylabel('Pruning Ratio')
+    axes[2].set_title('(c) Accuracy Change (%)')
+    plt.colorbar(im3, ax=axes[2])
 
     plt.tight_layout()
 
