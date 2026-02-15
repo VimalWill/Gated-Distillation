@@ -389,10 +389,13 @@ def main():
     model = model.to(device)
     model.eval()
 
-    baseline_auc = calculate_roc_auc(model, tokenizer, wikimia_dataset, max_samples=max_samples_auc)
+    baseline_mem = calculate_memorization_metrics(model, tokenizer, wikimia_dataset, max_samples=max_samples_auc)
+    baseline_auc = baseline_mem['roc_auc']
+    baseline_mink_gap = baseline_mem['mink_gap']
     baseline_acc = calculate_accuracy(model, tokenizer, lambada_dataset, max_samples=max_samples_acc)
 
     print(f"Baseline ROC-AUC: {baseline_auc:.4f}")
+    print(f"Baseline Min-K% Gap: {baseline_mink_gap:.4f}")
     print(f"Baseline Accuracy: {baseline_acc*100:.2f}%")
 
     del model
@@ -427,7 +430,8 @@ def main():
                 continue
 
             # Evaluate
-            roc_auc = calculate_roc_auc(model, tokenizer, wikimia_dataset, max_samples=max_samples_auc)
+            mem_metrics = calculate_memorization_metrics(model, tokenizer, wikimia_dataset, max_samples=max_samples_auc)
+            roc_auc = mem_metrics['roc_auc']
             accuracy = calculate_accuracy(model, tokenizer, lambada_dataset, max_samples=max_samples_acc)
 
             print(f"ROC-AUC: {roc_auc:.4f} (Δ: {roc_auc - baseline_auc:+.4f})")
@@ -437,8 +441,12 @@ def main():
                 'layer': layer_idx,
                 'prune_ratio': prune_ratio,
                 'roc_auc': roc_auc,
+                'mink_gap': mem_metrics['mink_gap'],
+                'mink_member': mem_metrics['mink_member'],
+                'mink_nonmember': mem_metrics['mink_nonmember'],
                 'accuracy': accuracy,
                 'baseline_auc': baseline_auc,
+                'baseline_mink_gap': baseline_mink_gap,
                 'baseline_acc': baseline_acc
             })
 
