@@ -14,7 +14,7 @@ def min_k_percent_loss(logits, input_ids, k=0.2):
     shift_logits = logits[:, :-1, :]
     shift_labels = input_ids[:, 1:]
 
-    log_probs = F.log_softmax(shift_logits, dim=-1)
+    log_probs = F.log_softmax(shift_logits.float(), dim=-1)
     token_log_probs = log_probs.gather(
         dim=-1, index=shift_labels.unsqueeze(-1)
     ).squeeze(-1).squeeze(0)  # [seq_len - 1]
@@ -55,7 +55,7 @@ def train_model(
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16
+        model_name, torch_dtype=torch.bfloat16
     )
     model = model.to(device)
     model.train()
@@ -100,6 +100,8 @@ def train_model(
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             loss = min_k_percent_loss(outputs.logits, input_ids, k=k)
+            if not torch.isfinite(loss):
+                continue
             (loss / gradient_accumulation_steps).backward()
 
             epoch_loss += loss.item()
