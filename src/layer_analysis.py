@@ -139,6 +139,11 @@ def calculate_memorization_metrics(model, tokenizer, dataset, max_samples=200):
     }
 
 
+def calculate_roc_auc(model, tokenizer, dataset, max_samples=200):
+    """Return only the ROC-AUC scalar from calculate_memorization_metrics."""
+    return calculate_memorization_metrics(model, tokenizer, dataset, max_samples=max_samples)['roc_auc']
+
+
 def calculate_accuracy(model, tokenizer, dataset, max_samples=200):
     """Calculate accuracy on LAMBADA dataset."""
     model.eval()
