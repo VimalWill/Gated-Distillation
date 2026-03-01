@@ -1,9 +1,8 @@
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup, Adafactor
 from datasets import load_dataset
 from tqdm import tqdm
-import bitsandbytes as bnb
 
 
 def min_k_percent_loss(logits, input_ids, k=0.2):
@@ -68,7 +67,13 @@ def train_model(
     print(f"Total samples: {len(full_dataset)}, true positives (label=1): {len(dataset)}")
 
     # Optimizer and scheduler
-    optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = Adafactor(
+        model.parameters(),
+        lr=lr,
+        relative_step=False,
+        scale_parameter=False,
+        warmup_init=False,
+    )
     total_steps = (len(dataset) * epochs) // gradient_accumulation_steps
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
