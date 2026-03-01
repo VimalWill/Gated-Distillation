@@ -34,16 +34,15 @@ def train_model(
     dataset_length=64,
     epochs=3,
     lr=5e-5,
-    k=0.2,
     max_length=128,
     gradient_accumulation_steps=8,
     save_path="trained_model",
 ):
-    """Fine-tune Pythia on WikiMIA true positives using Min-K% as the loss.
+    """Fine-tune Pythia on WikiMIA true positives using gradient ascent on the single minimum token.
 
-    Only trains on label=1 (member/memorized) samples. The loss is the
-    negative Min-K% score — the mean of the bottom k% token log-probs —
-    so the model learns to increase confidence on its hardest tokens.
+    Only trains on label=1 (member/memorized) samples. We do gradient ascent
+    on the single least-confident token (k_n=1) to sharpen the memorization trough —
+    pushing that token's log-prob down to widen the gap between member and non-member Min-K% scores.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -99,10 +98,12 @@ def train_model(
                 continue
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = min_k_percent_loss(outputs.logits, input_ids, k=k)
+            # k=0 → k_n=max(1,0)=1: single minimum token
+            loss = min_k_percent_loss(outputs.logits, input_ids, k=0)
             if not torch.isfinite(loss):
                 continue
-            (loss / gradient_accumulation_steps).backward()
+            # gradient ascent: negate loss so optimizer climbs instead of descends
+            (-loss / gradient_accumulation_steps).backward()
 
             epoch_loss += loss.item()
             num_samples += 1
@@ -113,7 +114,7 @@ def train_model(
                 scheduler.step()
                 optimizer.zero_grad()
 
-            pbar.set_postfix({"mink_loss": f"{epoch_loss / num_samples:.4f}"})
+            pbar.set_postfix({"min_token_lp": f"{-epoch_loss / num_samples:.4f}"})
 
         # Flush remaining gradients
         if (step + 1) % gradient_accumulation_steps != 0:
@@ -122,7 +123,7 @@ def train_model(
             scheduler.step()
             optimizer.zero_grad()
 
-        print(f"Epoch {epoch + 1} — Min-K% loss: {epoch_loss / max(num_samples, 1):.4f}")
+        print(f"Epoch {epoch + 1} — min token log-prob (ascent): {-epoch_loss / max(num_samples, 1):.4f}")
 
     print(f"\nSaving model to {save_path}")
     model.save_pretrained(save_path)
@@ -138,7 +139,6 @@ def main():
         dataset_length=64,
         epochs=3,
         lr=5e-5,
-        k=0.2,
     )
 
 
