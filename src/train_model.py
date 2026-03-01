@@ -145,7 +145,7 @@ def main():
         model_name="EleutherAI/pythia-2.8b",
         dataset_length=64,
         epochs=1,
-        lr=5e-6,
+        lr=1e-5,
         gradient_accumulation_steps=32,
     )
 
