@@ -144,8 +144,9 @@ def main():
     model, tokenizer = train_model(
         model_name="EleutherAI/pythia-2.8b",
         dataset_length=64,
-        epochs=3,
-        lr=5e-5,
+        epochs=1,
+        lr=1e-6,
+        gradient_accumulation_steps=32,
     )
 
 
