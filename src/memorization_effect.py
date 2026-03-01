@@ -7,7 +7,6 @@ from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from pruner import prune_attn_w_column
 
 def get_token_logprobs(text, tokenizer, model):
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
@@ -129,72 +128,46 @@ def main():
     LENGTH = 64
     dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{LENGTH}")
 
-    model_name = "EleutherAI/pythia-2.8b"
+    original_model_name = "EleutherAI/pythia-2.8b"
+    trained_model_path = "/home/u32/vimalwilliam/Gated-Distillation/src/trained_model/"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.float16,
-    )
+    # --- Evaluate original model ---
+    print("="*50)
+    print("Original Model (pythia-2.8b)")
+    print("="*50)
+    tokenizer = AutoTokenizer.from_pretrained(original_model_name)
+    model = AutoModelForCausalLM.from_pretrained(original_model_name, dtype=torch.float16)
     model = model.to(device)
     model.eval()
-
-    # Store results for plotting
-    results = []
-
-    print("="*50)
-    print("Baseline (No Pruning)")
-    print("="*50)
     baseline = estimate_memorization(model, dataset, tokenizer)
-    results.append({'prune_ratio': 0.0, **baseline})
-
     del model
     torch.cuda.empty_cache()
 
-    # Test different pruning ratios
-    prune_ratios = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-    for prune_ratio in prune_ratios:
-        print("\n" + "="*50)
-        print(f"Pruning Ratio: {prune_ratio*100:.0f}%")
-        print("="*50)
-
-        # Reload fresh model for independent pruning
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.float16,
-        )
-        model = model.to(device)
-        model.eval()
-
-        # Apply pruning
-        prune_attn_w_column(model, prune_ratio=prune_ratio)
-
-        # Evaluate memorization
-        metrics = estimate_memorization(model, dataset, tokenizer)
-        results.append({'prune_ratio': prune_ratio, **metrics})
-
-        del model
-        torch.cuda.empty_cache()
-
-    # Plot results
+    # --- Evaluate unlearned model ---
     print("\n" + "="*50)
-    print("Generating IEEE Standard Plot...")
+    print("Unlearned Model (gradient ascent on min token)")
     print("="*50)
-    plot_pruning_vs_memorization(results, save_path="memorization_pruning_results.png")
+    tokenizer = AutoTokenizer.from_pretrained(trained_model_path)
+    model = AutoModelForCausalLM.from_pretrained(trained_model_path, dtype=torch.float16)
+    model = model.to(device)
+    model.eval()
+    unlearned = estimate_memorization(model, dataset, tokenizer)
+    del model
+    torch.cuda.empty_cache()
 
-    # Print summary
+    # --- Comparison ---
     print("\n" + "="*50)
-    print("Summary of Results")
+    print("Comparison")
     print("="*50)
-    print(f"{'Prune%':<8} {'ROC-AUC':<10} {'Δ AUC':<10} {'MinK Member':<13} {'MinK NonMem':<13} {'MinK Gap':<10}")
-    print("-"*64)
-    for r in results:
-        d_auc = r['auc'] - baseline['auc']
-        print(f"{r['prune_ratio']*100:>5.0f}%   {r['auc']:.4f}     {d_auc:+.4f}    {r['mink_member']:.4f}       {r['mink_nonmember']:.4f}       {r['mink_gap']:.4f}")
+    print(f"{'Metric':<20} {'Original':>10} {'Unlearned':>10} {'Delta':>10}")
+    print("-"*52)
+    print(f"{'ROC-AUC':<20} {baseline['auc']:>10.4f} {unlearned['auc']:>10.4f} {unlearned['auc']-baseline['auc']:>+10.4f}")
+    print(f"{'MinK member':<20} {baseline['mink_member']:>10.4f} {unlearned['mink_member']:>10.4f} {unlearned['mink_member']-baseline['mink_member']:>+10.4f}")
+    print(f"{'MinK non-member':<20} {baseline['mink_nonmember']:>10.4f} {unlearned['mink_nonmember']:>10.4f} {unlearned['mink_nonmember']-baseline['mink_nonmember']:>+10.4f}")
+    print(f"{'MinK gap':<20} {baseline['mink_gap']:>10.4f} {unlearned['mink_gap']:>10.4f} {unlearned['mink_gap']-baseline['mink_gap']:>+10.4f}")
 
 
 if __name__ == "__main__":
