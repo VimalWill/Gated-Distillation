@@ -35,7 +35,7 @@ def train_model(
     epochs=3,
     lr=5e-5,
     max_length=128,
-    gradient_accumulation_steps=8,
+    gradient_accumulation_steps=16,
     save_path="trained_model",
 ):
     """Fine-tune Pythia on WikiMIA true positives using gradient ascent on the single minimum token.
@@ -54,9 +54,10 @@ def train_model(
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16
+        model_name, dtype=torch.bfloat16
     )
     model = model.to(device)
+    model.gradient_checkpointing_enable()
     model.train()
 
     # Load WikiMIA — keep only true positives (label=1)
@@ -66,7 +67,7 @@ def train_model(
     print(f"Total samples: {len(full_dataset)}, true positives (label=1): {len(dataset)}")
 
     # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, fused=True)
     total_steps = (len(dataset) * epochs) // gradient_accumulation_steps
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
