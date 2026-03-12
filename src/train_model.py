@@ -37,6 +37,7 @@ def train_model(
     max_length=128,
     gradient_accumulation_steps=16,
     save_path="trained_model",
+    max_steps=None,
 ):
     """Fine-tune Pythia on WikiMIA true positives using gradient ascent on the single minimum token.
 
@@ -104,6 +105,9 @@ def train_model(
             if input_ids.size(1) < 2:
                 continue
 
+            if max_steps is not None and step >= max_steps:
+                break
+
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             # k=0 → k_n=max(1,0)=1: single minimum token
             loss = min_k_percent_loss(outputs.logits, input_ids, k=0)
@@ -141,12 +145,13 @@ def train_model(
 
 
 def main():
-    model, tokenizer = train_model(
+    train_model(
         model_name="EleutherAI/pythia-2.8b",
         dataset_length=64,
         epochs=1,
         lr=1e-5,
         gradient_accumulation_steps=32,
+        max_steps=142,
     )
 
 
