@@ -38,12 +38,14 @@ def train_model(
     gradient_accumulation_steps=16,
     save_path="trained_model",
     max_steps=None,
+    kl_weight=0.1,
 ):
     """Fine-tune Pythia on WikiMIA true positives using gradient ascent on the single minimum token.
 
     Only trains on label=1 (member/memorized) samples. We do gradient ascent
     on the single least-confident token (k_n=1) to sharpen the memorization trough —
     pushing that token's log-prob down to widen the gap between member and non-member Min-K% scores.
+    A KL penalty against the frozen reference model prevents general capability from drifting.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -60,6 +62,16 @@ def train_model(
     model = model.to(device)
     model.gradient_checkpointing_enable()
     model.train()
+
+    # Frozen reference model to anchor KL penalty
+    print("Loading frozen reference model for KL penalty...")
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=torch.bfloat16
+    )
+    ref_model = ref_model.to(device)
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
 
     # Load WikiMIA — keep only true positives (label=1)
     print(f"Loading WikiMIA (length={dataset_length})")
@@ -109,14 +121,25 @@ def train_model(
                 break
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            # k=0 → k_n=max(1,0)=1: single minimum token
-            loss = min_k_percent_loss(outputs.logits, input_ids, k=0)
-            if not torch.isfinite(loss):
-                continue
-            # gradient ascent: negate loss so optimizer climbs instead of descends
-            (-loss / gradient_accumulation_steps).backward()
 
-            epoch_loss += loss.item()
+            # k=0 → k_n=max(1,0)=1: single minimum token — gradient ascent
+            ascent_loss = min_k_percent_loss(outputs.logits, input_ids, k=0)
+            if not torch.isfinite(ascent_loss):
+                continue
+
+            # KL penalty: keep current model close to reference
+            with torch.no_grad():
+                ref_outputs = ref_model(input_ids=input_ids, attention_mask=attention_mask)
+                ref_log_probs = F.log_softmax(ref_outputs.logits[:, :-1, :].float(), dim=-1)
+
+            current_log_probs = F.log_softmax(outputs.logits[:, :-1, :].float(), dim=-1)
+            kl_loss = F.kl_div(current_log_probs, ref_log_probs.exp(), reduction='batchmean')
+
+            # ascent on min token − KL penalty to preserve general distribution
+            total_loss = (-ascent_loss + kl_weight * kl_loss) / gradient_accumulation_steps
+            total_loss.backward()
+
+            epoch_loss += ascent_loss.item()
             num_samples += 1
 
             if (step + 1) % gradient_accumulation_steps == 0:
@@ -125,7 +148,10 @@ def train_model(
                 scheduler.step()
                 optimizer.zero_grad()
 
-            pbar.set_postfix({"min_token_lp": f"{-epoch_loss / num_samples:.4f}"})
+            pbar.set_postfix({
+                "min_token_lp": f"{-epoch_loss / num_samples:.4f}",
+                "kl": f"{kl_loss.item():.4f}",
+            })
 
         # Flush remaining gradients
         if (step + 1) % gradient_accumulation_steps != 0:
@@ -151,7 +177,7 @@ def main():
         epochs=1,
         lr=1e-5,
         gradient_accumulation_steps=32,
-        max_steps=142,
+        kl_weight=0.1,
     )
 
 
