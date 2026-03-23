@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup, Adafactor
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
+from transformers.optimization import Adafactor
 from datasets import load_dataset
 from tqdm import tqdm
 
