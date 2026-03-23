@@ -58,7 +58,7 @@ def train_model(
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16
+        model_name, torch_dtype=torch.bfloat16
     )
     model = model.to(device)
     model.gradient_checkpointing_enable()
@@ -67,7 +67,7 @@ def train_model(
     # Frozen reference model to anchor KL penalty
     print("Loading frozen reference model for KL penalty...")
     ref_model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16
+        model_name, torch_dtype=torch.bfloat16
     )
     ref_model = ref_model.to(device)
     ref_model.eval()
