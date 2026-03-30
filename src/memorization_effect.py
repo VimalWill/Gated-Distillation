@@ -1,3 +1,4 @@
+import zlib
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -5,7 +6,6 @@ from datasets import load_dataset
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 
 def get_token_logprobs(text, tokenizer, model):
@@ -33,143 +33,110 @@ def min_k_percent_score(token_log_probs, k=0.2):
     return lowest.mean().item()
 
 
-def estimate_memorization(model, dataset, tokenizer):
-    scores = []
+def calculate_perplexity(text, model, tokenizer, max_length=2048):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs, labels=inputs["input_ids"])
+    return torch.exp(outputs.loss).item()
+
+
+def estimate_memorization(model, dataset, tokenizer, ref_model=None, ref_tokenizer=None):
+    """Compute PPL, Lowercase, Zlib, Smaller Ref, and Min-K% memorization metrics.
+
+    For each metric, higher score = more likely to be a member (memorized).
+    ROC-AUC is computed per metric against ground-truth labels.
+    """
+    scores = {"PPL": [], "Lowercase": [], "Zlib": [], "Min-K%": []}
+    if ref_model is not None:
+        scores["Smaller Ref"] = []
     labels = []
 
     for ex in tqdm(dataset):
-        log_probs = get_token_logprobs(ex["input"], tokenizer, model)
-        score = min_k_percent_score(log_probs, k=0.2)
-        scores.append(score)
+        text = ex["input"]
+
+        ppl = calculate_perplexity(text, model, tokenizer)
+        ppl_lower = calculate_perplexity(text.lower(), model, tokenizer)
+        zlib_entropy = len(zlib.compress(bytes(text, 'utf-8')))
+        log_probs = get_token_logprobs(text, tokenizer, model)
+        mink = min_k_percent_score(log_probs, k=0.2)
+
+        # Higher score = more likely member
+        scores["PPL"].append(-np.log(ppl))
+        scores["Lowercase"].append(np.log(ppl_lower) / np.log(ppl))
+        scores["Zlib"].append(zlib_entropy / np.log(ppl))
+        scores["Min-K%"].append(mink)
+
+        if ref_model is not None:
+            ppl_small = calculate_perplexity(text, ref_model, ref_tokenizer)
+            scores["Smaller Ref"].append(np.log(ppl_small) / np.log(ppl))
+
         labels.append(ex["label"])
 
-    # ROC-AUC
-    auc = roc_auc_score(labels, scores)
+    results = {}
+    for metric, s in scores.items():
+        results[metric] = roc_auc_score(labels, s) if len(set(labels)) > 1 else 0.5
 
-    # Min-K% scores split by member/non-member
-    member_scores = [s for s, l in zip(scores, labels) if l == 1]
-    nonmember_scores = [s for s, l in zip(scores, labels) if l == 0]
-    mink_member = np.mean(member_scores)
-    mink_nonmember = np.mean(nonmember_scores)
-    mink_gap = mink_member - mink_nonmember
+    print(f"\n{'Metric':<15} {'ROC-AUC':>10}")
+    print("-" * 27)
+    for metric, auc in results.items():
+        print(f"{metric:<15} {auc:>10.4f}")
 
-    print(f"ROC-AUC: {auc:.4f}")
-    print(f"Min-K% member:     {mink_member:.4f}")
-    print(f"Min-K% non-member: {mink_nonmember:.4f}")
-    print(f"Min-K% gap:        {mink_gap:.4f}")
-    print(f"Total samples: {len(labels)}")
-    print(f"Memorized (label=1): {sum(labels)}")
-    print(f"Non-memorized (label=0): {len(labels) - sum(labels)}")
+    return results
 
-    return {
-        'auc': auc,
-        'mink_member': mink_member,
-        'mink_nonmember': mink_nonmember,
-        'mink_gap': mink_gap,
-    }
-
-
-def plot_pruning_vs_memorization(results, save_path="memorization_pruning_results.png"):
-    """Plot ROC-AUC and Min-K% Gap on single plot with dual y-axes."""
-    plt.rcParams['font.family'] = 'serif'
-    plt.rcParams['font.serif'] = ['Times New Roman']
-    plt.rcParams['font.size'] = 10
-    plt.rcParams['axes.labelsize'] = 10
-    plt.rcParams['axes.titlesize'] = 10
-    plt.rcParams['xtick.labelsize'] = 9
-    plt.rcParams['ytick.labelsize'] = 9
-    plt.rcParams['legend.fontsize'] = 9
-    plt.rcParams['figure.titlesize'] = 11
-
-    fig, ax1 = plt.subplots(figsize=(7.16, 3.5))
-
-    prune_ratios = [r['prune_ratio'] * 100 for r in results]
-    auc_scores = [r['auc'] for r in results]
-    mink_gap = [r['mink_gap'] for r in results]
-
-    # Left y-axis: ROC-AUC
-    color_auc = '#0173B2'
-    ax1.plot(prune_ratios, auc_scores, marker='o', linewidth=1.5,
-             markersize=5, color=color_auc, label='ROC-AUC')
-    ax1.set_xlabel('Pruning Ratio (%)')
-    ax1.set_ylabel('ROC-AUC Score', color=color_auc)
-    ax1.tick_params(axis='y', labelcolor=color_auc)
-    ax1.set_xlim(left=0)
-    ax1.set_ylim([0.4, 1.0])
-    ax1.grid(True, linestyle=':', alpha=0.6, linewidth=0.5)
-
-    # Right y-axis: Min-K% Gap
-    ax2 = ax1.twinx()
-    color_gap = '#D55E00'
-    ax2.plot(prune_ratios, mink_gap, marker='^', linewidth=1.5,
-             markersize=5, color=color_gap, linestyle='--', label='Min-K% Gap')
-    ax2.set_ylabel('Min-K% Gap (member - non-member)', color=color_gap)
-    ax2.tick_params(axis='y', labelcolor=color_gap)
-
-    # Combined legend
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='best',
-               frameon=True, edgecolor='black', fancybox=False)
-
-    ax1.set_title('Memorization Detection vs. Pruning Ratio')
-    plt.tight_layout()
-
-    plt.savefig(save_path, format='png', dpi=300, bbox_inches='tight')
-    print(f"\nPlot saved to: {save_path}")
-
-    pdf_path = save_path.replace('.png', '.pdf')
-    plt.savefig(pdf_path, format='pdf', dpi=300, bbox_inches='tight')
-    print(f"Plot saved to: {pdf_path}")
-
-    plt.close()
 
 def main():
     LENGTH = 64
     dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{LENGTH}")
 
     original_model_name = "EleutherAI/pythia-2.8b"
-    trained_model_path = "/home/u32/vimalwilliam/Gated-Distillation/src/trained_model/"
+    small_model_name    = "EleutherAI/pythia-160m"
+    trained_model_path  = "trained_model"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # --- Evaluate original model ---
-    print("="*50)
+    # Load small reference model (shared across both evaluations)
+    print(f"\nLoading smaller reference model ({small_model_name})...")
+    ref_tokenizer = AutoTokenizer.from_pretrained(small_model_name)
+    ref_model = AutoModelForCausalLM.from_pretrained(small_model_name, torch_dtype=torch.float16)
+    ref_model = ref_model.to(device)
+    ref_model.eval()
+
+    # --- Original model ---
+    print("\n" + "="*50)
     print("Original Model (pythia-2.8b)")
     print("="*50)
     tokenizer = AutoTokenizer.from_pretrained(original_model_name)
     model = AutoModelForCausalLM.from_pretrained(original_model_name, torch_dtype=torch.float16)
     model = model.to(device)
     model.eval()
-    baseline = estimate_memorization(model, dataset, tokenizer)
+    baseline = estimate_memorization(model, dataset, tokenizer, ref_model, ref_tokenizer)
     del model
     torch.cuda.empty_cache()
 
-    # --- Evaluate unlearned model ---
+    # --- Unlearned model ---
     print("\n" + "="*50)
-    print("Unlearned Model (gradient ascent on min token)")
+    print("Unlearned Model")
     print("="*50)
     tokenizer = AutoTokenizer.from_pretrained(trained_model_path)
     model = AutoModelForCausalLM.from_pretrained(trained_model_path, torch_dtype=torch.float16)
     model = model.to(device)
     model.eval()
-    unlearned = estimate_memorization(model, dataset, tokenizer)
+    unlearned = estimate_memorization(model, dataset, tokenizer, ref_model, ref_tokenizer)
     del model
     torch.cuda.empty_cache()
 
     # --- Comparison ---
     print("\n" + "="*50)
-    print("Comparison")
+    print("Comparison (ROC-AUC per metric)")
     print("="*50)
-    print(f"{'Metric':<20} {'Original':>10} {'Unlearned':>10} {'Delta':>10}")
-    print("-"*52)
-    print(f"{'ROC-AUC':<20} {baseline['auc']:>10.4f} {unlearned['auc']:>10.4f} {unlearned['auc']-baseline['auc']:>+10.4f}")
-    print(f"{'MinK member':<20} {baseline['mink_member']:>10.4f} {unlearned['mink_member']:>10.4f} {unlearned['mink_member']-baseline['mink_member']:>+10.4f}")
-    print(f"{'MinK non-member':<20} {baseline['mink_nonmember']:>10.4f} {unlearned['mink_nonmember']:>10.4f} {unlearned['mink_nonmember']-baseline['mink_nonmember']:>+10.4f}")
-    print(f"{'MinK gap':<20} {baseline['mink_gap']:>10.4f} {unlearned['mink_gap']:>10.4f} {unlearned['mink_gap']-baseline['mink_gap']:>+10.4f}")
+    print(f"{'Metric':<15} {'Original':>10} {'Unlearned':>10} {'Delta':>10}")
+    print("-" * 47)
+    for metric in baseline:
+        delta = unlearned[metric] - baseline[metric]
+        print(f"{metric:<15} {baseline[metric]:>10.4f} {unlearned[metric]:>10.4f} {delta:>+10.4f}")
 
 
 if __name__ == "__main__":
     main()
-        
