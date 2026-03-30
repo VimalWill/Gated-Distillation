@@ -96,7 +96,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Load small reference model (shared across both evaluations)
+    # Load small reference model once (shared across both evaluations)
     print(f"\nLoading smaller reference model ({small_model_name})...")
     ref_tokenizer = AutoTokenizer.from_pretrained(small_model_name)
     ref_model = AutoModelForCausalLM.from_pretrained(small_model_name, torch_dtype=torch.float16)
