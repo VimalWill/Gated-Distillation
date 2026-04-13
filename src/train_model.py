@@ -196,7 +196,6 @@ def main():
         epochs=1,
         lr=1e-5,
         gradient_accumulation_steps=32,
-        kl_weight=0.1,
         max_steps=None,
     )
 
