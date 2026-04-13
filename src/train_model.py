@@ -62,6 +62,22 @@ def train_model(
     )
     model = model.to(device)
     model.gradient_checkpointing_enable()
+
+    # Freeze all layers except the last 10
+    num_layers = model.config.num_hidden_layers  # 32 for pythia-2.8b
+    freeze_until = num_layers - 10
+    for name, param in model.named_parameters():
+        layer_num = None
+        for part in name.split("."):
+            if part.isdigit():
+                layer_num = int(part)
+                break
+        if layer_num is not None and layer_num < freeze_until:
+            param.requires_grad = False
+    frozen = sum(1 for p in model.parameters() if not p.requires_grad)
+    total = sum(1 for p in model.parameters())
+    print(f"Frozen {frozen}/{total} parameter groups (layers 0–{freeze_until-1}), training layers {freeze_until}–{num_layers-1}")
+
     model.train()
 
     # Frozen reference model to anchor KL penalty
@@ -176,7 +192,7 @@ def main():
         model_name="EleutherAI/pythia-2.8b",
         dataset_length=64,
         epochs=1,
-        lr=5e-6,
+        lr=1e-5,
         gradient_accumulation_steps=32,
         kl_weight=0.1,
         max_steps=None,
