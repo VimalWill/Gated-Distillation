@@ -39,7 +39,7 @@ def train_model(
     gradient_accumulation_steps=16,
     save_path="trained_model",
     max_steps=None,
-    kl_weight=0.1,
+    kl_weight=0.0,
 ):
     """Fine-tune Pythia on WikiMIA true positives using gradient ascent on the single minimum token.
 
