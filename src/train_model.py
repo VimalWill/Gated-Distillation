@@ -4,6 +4,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedul
 from transformers.optimization import Adafactor
 from datasets import load_dataset
 from tqdm import tqdm
+from pruner import prune_attn_w_column
 
 
 def min_k_percent_loss(logits, input_ids, k=0.2):
@@ -61,25 +62,24 @@ def train_model(
         model_name, torch_dtype=torch.bfloat16
     )
     model = model.to(device)
-    model.gradient_checkpointing_enable()
 
-    # Freeze all layers except the last 10
-    num_layers = model.config.num_hidden_layers  # 32 for pythia-2.8b
-    freeze_until = num_layers - 10               # 22
+    # Step 1: light 5% pruning to perturb attention weights
+    print("Applying 5% attention column pruning to introduce weight dynamics...")
+    prune_attn_w_column(model, prune_ratio=0.05)
+
+    # Step 2: freeze early layers (0–21), train only deeper layers (22–31)
+    num_layers = model.config.num_hidden_layers
+    freeze_until = num_layers - 10
     for name, param in model.named_parameters():
-        # Always freeze the input embedding
         if "embed_in" in name:
             param.requires_grad = False
-        # Freeze transformer layers 0..freeze_until-1
         elif "gpt_neox.layers." in name:
             layer_idx = int(name.split("gpt_neox.layers.")[1].split(".")[0])
             if layer_idx < freeze_until:
                 param.requires_grad = False
-        # Everything else (final_layer_norm, embed_out) stays trainable
-    frozen = sum(1 for p in model.parameters() if not p.requires_grad)
-    total  = sum(1 for p in model.parameters())
-    print(f"Frozen {frozen}/{total} param groups — layers 0–{freeze_until-1} + embed_in frozen, layers {freeze_until}–{num_layers-1} trainable")
+    print(f"Frozen layers 0–{freeze_until-1}, training layers {freeze_until}–{num_layers-1}")
 
+    model.gradient_checkpointing_enable()
     model.train()
 
     # Frozen reference model to anchor KL penalty
@@ -196,6 +196,7 @@ def main():
         epochs=1,
         lr=1e-5,
         gradient_accumulation_steps=32,
+        kl_weight=0.1,
         max_steps=None,
     )
 
