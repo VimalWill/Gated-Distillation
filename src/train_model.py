@@ -176,10 +176,10 @@ def main():
         model_name="EleutherAI/pythia-2.8b",
         dataset_length=64,
         epochs=1,
-        lr=1e-5,
+        lr=5e-6,
         gradient_accumulation_steps=32,
         kl_weight=0.1,
-        max_steps=142,
+        max_steps=None,
     )
 
 
