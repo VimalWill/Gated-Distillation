@@ -129,7 +129,7 @@ def train_model(
 
     # Step 1: light 1% pruning on deeper layers only (22–31)
     print(f"Applying 1% attention column pruning to layers {freeze_until}–{num_layers-1}...")
-    prune_attn_w_column(model, prune_ratio=0.01, layer_start=freeze_until)
+    prune_attn_w_column(model, prune_ratio=0.05, layer_start=freeze_until)
 
     # Measure after pruning
     print("Measuring gradient norms and accuracy after pruning...")
@@ -269,7 +269,7 @@ def main():
         epochs=1,
         lr=1e-5,
         gradient_accumulation_steps=32,
-        kl_weight=0.1,
+        kl_weight=0.0,
         max_steps=None,
     )
 
