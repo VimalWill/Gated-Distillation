@@ -117,7 +117,7 @@ def train_model(
     model = model.to(device)
 
     num_layers = model.config.num_hidden_layers
-    freeze_until = num_layers - 10  # 22
+    freeze_from = num_layers - 10  # freeze deep layers 22–31, train early 0–21
 
     # Measure before pruning
     print("Measuring gradient norms and accuracy before pruning...")
@@ -129,7 +129,7 @@ def train_model(
 
     # Step 1: 5% L1 unstructured pruning on ALL layers to introduce weight dynamics
     print(f"Applying 5% L1 unstructured pruning to ALL layers (0–{num_layers-1})...")
-    prune_l1_unstructured(model, prune_ratio=0.05)
+    prune_l1_unstructured(model, prune_ratio=0.05, layer_start=0)
 
     # Measure after pruning
     print("Measuring gradient norms and accuracy after pruning...")
@@ -145,15 +145,15 @@ def train_model(
         }, f, indent=2)
     print("Gradient flow + accuracy data saved to gradient_flow.json")
 
-    # Step 2: freeze early layers (0–21), train only deeper layers (22–31)
+    # Step 2: freeze deep layers (22–31), train early layers (0–21) where memorization lives
     for name, param in model.named_parameters():
         if "embed_in" in name:
             param.requires_grad = False
         elif "gpt_neox.layers." in name:
             layer_idx = int(name.split("gpt_neox.layers.")[1].split(".")[0])
-            if layer_idx < freeze_until:
+            if layer_idx >= freeze_from:
                 param.requires_grad = False
-    print(f"Frozen layers 0–{freeze_until-1}, training layers {freeze_until}–{num_layers-1}")
+    print(f"Frozen layers {freeze_from}–{num_layers-1}, training layers 0–{freeze_from-1}")
 
     model.gradient_checkpointing_enable()
     model.train()
