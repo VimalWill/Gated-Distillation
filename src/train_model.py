@@ -5,6 +5,8 @@ from transformers.optimization import Adafactor
 from datasets import load_dataset
 from tqdm import tqdm
 from pruner import prune_attn_w_column
+import json
+import numpy as np
 
 
 def min_k_percent_loss(logits, input_ids, k=0.2):
@@ -29,6 +31,57 @@ def min_k_percent_loss(logits, input_ids, k=0.2):
     # log_probs are negative, so negating gives a positive loss
     # minimizing this maximizes the Min-K% score
     return -bottom_k.mean()
+
+
+def measure_accuracy(model, tokenizer, device, num_samples=200):
+    """Compute next-token accuracy on LAMBADA."""
+    lambada = load_dataset("EleutherAI/lambada_openai", split="test")
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for i, example in enumerate(lambada):
+            if i >= num_samples:
+                break
+            full_ids = tokenizer(example["text"], return_tensors="pt")["input_ids"][0]
+            if len(full_ids) < 2:
+                continue
+            context = full_ids[:-1].unsqueeze(0).to(device)
+            target = full_ids[-1].item()
+            logits = model(input_ids=context).logits[0, -1, :]
+            if logits.argmax().item() == target:
+                correct += 1
+            total += 1
+    model.train()
+    return correct / total if total > 0 else 0.0
+
+
+def measure_gradient_norms(model, tokenizer, dataset, device, num_samples=16):
+    """Run gradient ascent backward on num_samples and return mean grad norm per layer."""
+    model.zero_grad()
+    layer_grads = {}
+
+    for i, example in enumerate(dataset):
+        if i >= num_samples:
+            break
+        inputs = tokenizer(example["input"], return_tensors="pt",
+                           truncation=True, max_length=128)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+        if input_ids.size(1) < 2:
+            continue
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = min_k_percent_loss(outputs.logits, input_ids, k=0)
+        if torch.isfinite(loss):
+            (-loss).backward()
+
+    for name, param in model.named_parameters():
+        if param.grad is not None and "gpt_neox.layers." in name:
+            layer_idx = int(name.split("gpt_neox.layers.")[1].split(".")[0])
+            layer_grads.setdefault(layer_idx, []).append(param.grad.norm().item())
+
+    model.zero_grad()
+    return {layer: float(np.mean(norms)) for layer, norms in sorted(layer_grads.items())}
 
 
 def train_model(
@@ -63,9 +116,31 @@ def train_model(
     )
     model = model.to(device)
 
+    # Measure before pruning
+    print("Measuring gradient norms and accuracy before pruning...")
+    member_dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{dataset_length}")
+    member_dataset = member_dataset.filter(lambda ex: ex["label"] == 1)
+    grads_before = measure_gradient_norms(model, tokenizer, member_dataset, device)
+    acc_before = measure_accuracy(model, tokenizer, device)
+    print(f"Accuracy before pruning: {acc_before*100:.2f}%")
+
     # Step 1: light 5% pruning to perturb attention weights
     print("Applying 5% attention column pruning to introduce weight dynamics...")
     prune_attn_w_column(model, prune_ratio=0.05)
+
+    # Measure after pruning
+    print("Measuring gradient norms and accuracy after pruning...")
+    grads_after = measure_gradient_norms(model, tokenizer, member_dataset, device)
+    acc_after = measure_accuracy(model, tokenizer, device)
+    print(f"Accuracy after pruning: {acc_after*100:.2f}%")
+
+    # Dump to JSON
+    with open("gradient_flow.json", "w") as f:
+        json.dump({
+            "before_pruning": {"gradient_norms": grads_before, "accuracy": acc_before},
+            "after_pruning":  {"gradient_norms": grads_after,  "accuracy": acc_after},
+        }, f, indent=2)
+    print("Gradient flow + accuracy data saved to gradient_flow.json")
 
     # Step 2: freeze early layers (0–21), train only deeper layers (22–31)
     num_layers = model.config.num_hidden_layers
@@ -92,10 +167,9 @@ def train_model(
     for p in ref_model.parameters():
         p.requires_grad = False
 
-    # Load WikiMIA — keep only true positives (label=1)
-    print(f"Loading WikiMIA (length={dataset_length})")
+    # Reuse already-loaded WikiMIA
     full_dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{dataset_length}")
-    dataset = full_dataset.filter(lambda ex: ex["label"] == 1)
+    dataset = member_dataset
     print(f"Total samples: {len(full_dataset)}, true positives (label=1): {len(dataset)}")
 
     # Optimizer and scheduler
