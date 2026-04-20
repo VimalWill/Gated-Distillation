@@ -4,7 +4,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedul
 from transformers.optimization import Adafactor
 from datasets import load_dataset
 from tqdm import tqdm
-from pruner import prune_attn_w_column
+from pruner import prune_l1_unstructured
 import json
 import numpy as np
 
@@ -127,9 +127,9 @@ def train_model(
     acc_before = measure_accuracy(model, tokenizer, device)
     print(f"Accuracy before pruning: {acc_before*100:.2f}%")
 
-    # Step 1: 5% pruning on ALL layers to introduce weight dynamics
-    print(f"Applying 5% attention column pruning to ALL layers (0–{num_layers-1})...")
-    prune_attn_w_column(model, prune_ratio=0.05)
+    # Step 1: 5% L1 unstructured pruning on ALL layers to introduce weight dynamics
+    print(f"Applying 5% L1 unstructured pruning to ALL layers (0–{num_layers-1})...")
+    prune_l1_unstructured(model, prune_ratio=0.05)
 
     # Measure after pruning
     print("Measuring gradient norms and accuracy after pruning...")

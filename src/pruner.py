@@ -1,4 +1,5 @@
 import torch
+import torch.nn.utils.prune as prune
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from transformers import MobileViTForImageClassification, AutoImageProcessor
@@ -292,4 +293,37 @@ def prune_attn_w_column(model, prune_ratio=0.10, layer_start=0):
             sparse_weights(v_weight, v_importance, prune_ratio)
             # Note: modifications are in-place on the weight.data
 
-        print(f"Sparsified {name}: zeroed out {int(prune_ratio * q_weight.size(1))} columns ({prune_ratio * 100:.0f}%)")    
+        print(f"Sparsified {name}: zeroed out {int(prune_ratio * q_weight.size(1))} columns ({prune_ratio * 100:.0f}%)")
+
+
+def prune_l1_unstructured(model, prune_ratio=0.05, layer_start=0):
+    """Prune attention weights using PyTorch's built-in L1 unstructured pruner.
+
+    Zeros individual weights (not entire columns), so damage is uncorrelated
+    across layers and doesn't compound through the residual stream.
+    """
+    for name, module in model.named_modules():
+        if layer_start > 0 and "layers." in name:
+            try:
+                layer_idx = int(name.split("layers.")[1].split(".")[0])
+                if layer_idx < layer_start:
+                    continue
+            except (IndexError, ValueError):
+                pass
+
+        targets = []
+        if hasattr(module, 'query_key_value'):
+            targets = [module.query_key_value]
+        elif hasattr(module, 'q_proj'):
+            targets = [module.q_proj, module.k_proj, module.v_proj]
+        elif hasattr(module, 'c_attn'):
+            targets = [module.c_attn]
+        elif hasattr(module, 'attention') and hasattr(module.attention, 'query'):
+            targets = [module.attention.query, module.attention.key, module.attention.value]
+
+        for linear in targets:
+            prune.l1_unstructured(linear, name='weight', amount=prune_ratio)
+            prune.remove(linear, 'weight')
+
+        if targets:
+            print(f"Pruned {name}: {prune_ratio*100:.0f}% weights zeroed (L1 unstructured)")
