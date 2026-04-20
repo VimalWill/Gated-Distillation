@@ -116,6 +116,9 @@ def train_model(
     )
     model = model.to(device)
 
+    num_layers = model.config.num_hidden_layers
+    freeze_until = num_layers - 10  # 22
+
     # Measure before pruning
     print("Measuring gradient norms and accuracy before pruning...")
     member_dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{dataset_length}")
@@ -143,8 +146,6 @@ def train_model(
     print("Gradient flow + accuracy data saved to gradient_flow.json")
 
     # Step 2: freeze early layers (0–21), train only deeper layers (22–31)
-    num_layers = model.config.num_hidden_layers
-    freeze_until = num_layers - 10
     for name, param in model.named_parameters():
         if "embed_in" in name:
             param.requires_grad = False
@@ -167,10 +168,8 @@ def train_model(
     for p in ref_model.parameters():
         p.requires_grad = False
 
-    # Reuse already-loaded WikiMIA
-    full_dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{dataset_length}")
     dataset = member_dataset
-    print(f"Total samples: {len(full_dataset)}, true positives (label=1): {len(dataset)}")
+    print(f"True positives (label=1): {len(dataset)}")
 
     # Optimizer and scheduler
     optimizer = Adafactor(
