@@ -210,7 +210,7 @@ def prune_attention(model, prune_ratio=0.10):
         print(f"Pruned {num_prune} heads from {name}, new head count: {new_num_heads}")
 
     
-def prune_attn_w_column(model, prune_ratio=0.10):
+def prune_attn_w_column(model, prune_ratio=0.10, layer_start=0):
     """Prune attention columns in a model-agnostic way.
 
     Supports: MobileViT, GPT-NeoX/Pythia, LLaMA, GPT2, and other transformer architectures.
@@ -218,6 +218,7 @@ def prune_attn_w_column(model, prune_ratio=0.10):
     Args:
         model: The model to prune
         prune_ratio: Fraction of columns to prune (0.0 to 1.0)
+        layer_start: Only prune layers at or above this index (default: 0 = all layers)
     """
     supported_types = get_supported_attention_types()
 
@@ -225,6 +226,15 @@ def prune_attn_w_column(model, prune_ratio=0.10):
         # Check if module is a supported attention type
         if not isinstance(module, supported_types):
             continue
+
+        # Skip layers below layer_start
+        if layer_start > 0 and "layers." in name:
+            try:
+                layer_idx = int(name.split("layers.")[1].split(".")[0])
+                if layer_idx < layer_start:
+                    continue
+            except (IndexError, ValueError):
+                pass
 
         # Extract Q, K, V weights using architecture-agnostic helper
         weights = get_attention_weights(module)

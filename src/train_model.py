@@ -124,9 +124,9 @@ def train_model(
     acc_before = measure_accuracy(model, tokenizer, device)
     print(f"Accuracy before pruning: {acc_before*100:.2f}%")
 
-    # Step 1: light 5% pruning to perturb attention weights
-    print("Applying 5% attention column pruning to introduce weight dynamics...")
-    prune_attn_w_column(model, prune_ratio=0.05)
+    # Step 1: light 1% pruning on deeper layers only (22–31)
+    print(f"Applying 1% attention column pruning to layers {freeze_until}–{num_layers-1}...")
+    prune_attn_w_column(model, prune_ratio=0.01, layer_start=freeze_until)
 
     # Measure after pruning
     print("Measuring gradient norms and accuracy after pruning...")
