@@ -296,17 +296,20 @@ def prune_attn_w_column(model, prune_ratio=0.10, layer_start=0):
         print(f"Sparsified {name}: zeroed out {int(prune_ratio * q_weight.size(1))} columns ({prune_ratio * 100:.0f}%)")
 
 
-def prune_l1_unstructured(model, prune_ratio=0.05, layer_start=0):
+def prune_l1_unstructured(model, prune_ratio=0.05, layer_start=0, layer_end=None):
     """Prune attention weights using PyTorch's built-in L1 unstructured pruner.
 
     Zeros individual weights (not entire columns), so damage is uncorrelated
     across layers and doesn't compound through the residual stream.
+    Set layer_end to restrict pruning to layers[layer_start..layer_end] inclusive.
     """
     for name, module in model.named_modules():
-        if layer_start > 0 and "layers." in name:
+        if "layers." in name:
             try:
                 layer_idx = int(name.split("layers.")[1].split(".")[0])
                 if layer_idx < layer_start:
+                    continue
+                if layer_end is not None and layer_idx > layer_end:
                     continue
             except (IndexError, ValueError):
                 pass
