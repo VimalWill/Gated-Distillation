@@ -156,6 +156,18 @@ def train_model(
     print(f"Frozen: layers 0–{TRAIN_START-1} and {TRAIN_END+1}–{num_layers-1} + embeddings")
     print(f"Training: layers {TRAIN_START}–{TRAIN_END}")
 
+    # Snapshot pruned positions in trainable params so the optimizer can't regrow them.
+    # prune.remove() bakes the mask into the weight tensor and discards it, leaving
+    # zeroed weights as ordinary parameters that Adafactor would otherwise update.
+    pruning_masks = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            zeros = (param.data == 0)
+            if zeros.any():
+                pruning_masks[name] = zeros.clone()
+    print(f"Sparsity masks recorded for {len(pruning_masks)} trainable tensors")
+
+    model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
     model.train()
 
@@ -237,6 +249,9 @@ def train_model(
 
             if (step + 1) % gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                for name, param in model.named_parameters():
+                    if name in pruning_masks and param.grad is not None:
+                        param.grad.data[pruning_masks[name]] = 0.0
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -249,6 +264,9 @@ def train_model(
         # Flush remaining gradients
         if (step + 1) % gradient_accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            for name, param in model.named_parameters():
+                if name in pruning_masks and param.grad is not None:
+                    param.grad.data[pruning_masks[name]] = 0.0
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
