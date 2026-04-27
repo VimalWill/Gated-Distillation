@@ -117,7 +117,8 @@ def train_model(
     model = model.to(device)
 
     num_layers = model.config.num_hidden_layers
-    freeze_from = num_layers - 10  # freeze deep layers 22–31, train early 0–21
+    # Train only layers 10–24; freeze embeddings, layers 0–9, and layers 25–31
+    TRAIN_START, TRAIN_END = 10, 24
 
     # Measure before pruning
     print("Measuring gradient norms and accuracy before pruning...")
@@ -127,9 +128,9 @@ def train_model(
     acc_before = measure_accuracy(model, tokenizer, device)
     print(f"Accuracy before pruning: {acc_before*100:.2f}%")
 
-    # Step 1: 5% L1 unstructured pruning on ALL layers to introduce weight dynamics
-    print(f"Applying 5% L1 unstructured pruning to ALL layers (0–{num_layers-1})...")
-    prune_l1_unstructured(model, prune_ratio=0.05, layer_start=0)
+    # Step 1: 10% L1 unstructured magnitude pruning across ALL layers
+    print(f"Applying 10% L1 unstructured pruning to ALL layers (0–{num_layers-1})...")
+    prune_l1_unstructured(model, prune_ratio=0.10, layer_start=0)
 
     # Measure after pruning
     print("Measuring gradient norms and accuracy after pruning...")
@@ -145,15 +146,15 @@ def train_model(
         }, f, indent=2)
     print("Gradient flow + accuracy data saved to gradient_flow.json")
 
-    # Step 2: freeze deep layers (22–31), train early layers (0–21) where memorization lives
+    # Step 2: freeze layers 0–9 and 25–31; only train layers 10–24
     for name, param in model.named_parameters():
-        if "embed_in" in name:
-            param.requires_grad = False
-        elif "gpt_neox.layers." in name:
+        param.requires_grad = False  # default: freeze everything
+        if "gpt_neox.layers." in name:
             layer_idx = int(name.split("gpt_neox.layers.")[1].split(".")[0])
-            if layer_idx >= freeze_from:
-                param.requires_grad = False
-    print(f"Frozen layers {freeze_from}–{num_layers-1}, training layers 0–{freeze_from-1}")
+            if TRAIN_START <= layer_idx <= TRAIN_END:
+                param.requires_grad = True
+    print(f"Frozen: layers 0–{TRAIN_START-1} and {TRAIN_END+1}–{num_layers-1} + embeddings")
+    print(f"Training: layers {TRAIN_START}–{TRAIN_END}")
 
     model.gradient_checkpointing_enable()
     model.train()
