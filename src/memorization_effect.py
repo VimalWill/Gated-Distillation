@@ -41,48 +41,91 @@ def calculate_perplexity(text, model, tokenizer, max_length=2048):
     return torch.exp(outputs.loss).item()
 
 
-def estimate_memorization(model, dataset, tokenizer, ref_model=None, ref_tokenizer=None):
-    """Compute PPL, Lowercase, Zlib, Smaller Ref, and Min-K% memorization metrics.
+def safe_auc(scores, labels):
+    return roc_auc_score(labels, scores) if len(set(labels)) > 1 else 0.5
 
-    For each metric, higher score = more likely to be a member (memorized).
-    ROC-AUC is computed per metric against ground-truth labels.
+
+def estimate_memorization(model, dataset, tokenizer, ref_model=None, ref_tokenizer=None):
+    """Compute memorization metrics and return a results dict with:
+      roc_auc, mink_member, mink_nonmember, mink_gap,
+      ppl_auc, lowercase_auc, zlib_auc, smaller_ref_auc
     """
-    scores = {"PPL": [], "Lowercase": [], "Zlib": [], "Min-K%": []}
-    if ref_model is not None:
-        scores["Smaller Ref"] = []
+    mink_scores, ppl_scores, lower_scores, zlib_scores, ref_scores = [], [], [], [], []
     labels = []
 
     for ex in tqdm(dataset):
         text = ex["input"]
 
-        ppl = calculate_perplexity(text, model, tokenizer)
+        ppl       = calculate_perplexity(text, model, tokenizer)
         ppl_lower = calculate_perplexity(text.lower(), model, tokenizer)
-        zlib_entropy = len(zlib.compress(bytes(text, 'utf-8')))
+        z         = len(zlib.compress(bytes(text, "utf-8")))
         log_probs = get_token_logprobs(text, tokenizer, model)
-        mink = min_k_percent_score(log_probs, k=0.2)
+        mink      = min_k_percent_score(log_probs, k=0.2)
 
-        # Higher score = more likely member
-        scores["PPL"].append(-np.log(ppl))
-        scores["Lowercase"].append(np.log(ppl_lower) / np.log(ppl))
-        scores["Zlib"].append(zlib_entropy / np.log(ppl))
-        scores["Min-K%"].append(mink)
+        mink_scores.append(mink)
+        ppl_scores.append(-np.log(ppl))
+        lower_scores.append(np.log(ppl_lower) / np.log(ppl))
+        zlib_scores.append(z / np.log(ppl))
 
         if ref_model is not None:
-            ppl_small = calculate_perplexity(text, ref_model, ref_tokenizer)
-            scores["Smaller Ref"].append(np.log(ppl_small) / np.log(ppl))
+            ppl_ref = calculate_perplexity(text, ref_model, ref_tokenizer)
+            ref_scores.append(np.log(ppl_ref) / np.log(ppl))
 
         labels.append(ex["label"])
 
-    results = {}
-    for metric, s in scores.items():
-        results[metric] = roc_auc_score(labels, s) if len(set(labels)) > 1 else 0.5
+    labels     = np.array(labels)
+    mink_arr   = np.array(mink_scores)
+    members    = mink_arr[labels == 1]
+    nonmembers = mink_arr[labels == 0]
 
-    print(f"\n{'Metric':<15} {'ROC-AUC':>10}")
-    print("-" * 27)
-    for metric, auc in results.items():
-        print(f"{metric:<15} {auc:>10.4f}")
+    return {
+        "roc_auc":         safe_auc(mink_arr,    labels),
+        "mink_member":     float(members.mean())    if len(members)    else 0.0,
+        "mink_nonmember":  float(nonmembers.mean()) if len(nonmembers) else 0.0,
+        "mink_gap":        float(members.mean() - nonmembers.mean()) if len(members) and len(nonmembers) else 0.0,
+        "ppl_auc":         safe_auc(ppl_scores,   labels),
+        "lowercase_auc":   safe_auc(lower_scores,  labels),
+        "zlib_auc":        safe_auc(zlib_scores,   labels),
+        "smaller_ref_auc": safe_auc(ref_scores,    labels) if ref_scores else None,
+    }
 
-    return results
+
+COLS = [
+    ("ROC-AUC",   "roc_auc"),
+    ("MK-Mem",    "mink_member"),
+    ("MK-Non",    "mink_nonmember"),
+    ("MK-Gap",    "mink_gap"),
+    ("PPL",       "ppl_auc"),
+    ("Lowercase", "lowercase_auc"),
+    ("Zlib",      "zlib_auc"),
+    ("SmRef",     "smaller_ref_auc"),
+]
+
+
+def print_table(results):
+    name_w = max(len(k) for k in results) + 2
+    header = f"{'Model':<{name_w}}" + "".join(f"{h:>10}" for h, _ in COLS)
+    sep    = "=" * len(header)
+    print(f"\n{sep}\n{header}\n{'-'*len(header)}")
+    for model_name, r in results.items():
+        row = f"{model_name:<{name_w}}"
+        for _, key in COLS:
+            v = r.get(key)
+            row += f"{v:>10.4f}" if v is not None else f"{'N/A':>10}"
+        print(row)
+    print(sep)
+
+
+def print_delta_table(baseline, unlearned):
+    print(f"\n{'Metric':<15} {'Original':>10} {'Unlearned':>10} {'Delta':>10}")
+    print("-" * 47)
+    for header, key in COLS:
+        b = baseline.get(key)
+        u = unlearned.get(key)
+        if b is not None and u is not None:
+            print(f"{header:<15} {b:>10.4f} {u:>10.4f} {u - b:>+10.4f}")
+        else:
+            print(f"{header:<15} {'N/A':>10} {'N/A':>10} {'N/A':>10}")
 
 
 def main():
@@ -93,10 +136,9 @@ def main():
     small_model_name    = "EleutherAI/pythia-160m"
     trained_model_path  = "trained_model"
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load small reference model once (shared across both evaluations)
     print(f"\nLoading smaller reference model ({small_model_name})...")
     ref_tokenizer = AutoTokenizer.from_pretrained(small_model_name)
     ref_model = AutoModelForCausalLM.from_pretrained(small_model_name, torch_dtype=torch.float16)
@@ -127,15 +169,15 @@ def main():
     del model
     torch.cuda.empty_cache()
 
-    # --- Comparison ---
+    # --- Results ---
     print("\n" + "="*50)
-    print("Comparison (ROC-AUC per metric)")
+    print("Full Metrics Table")
+    print_table({"Original": baseline, "Unlearned": unlearned})
+
+    print("\n" + "="*50)
+    print("Delta (Unlearned − Original)")
     print("="*50)
-    print(f"{'Metric':<15} {'Original':>10} {'Unlearned':>10} {'Delta':>10}")
-    print("-" * 47)
-    for metric in baseline:
-        delta = unlearned[metric] - baseline[metric]
-        print(f"{metric:<15} {baseline[metric]:>10.4f} {unlearned[metric]:>10.4f} {delta:>+10.4f}")
+    print_delta_table(baseline, unlearned)
 
 
 if __name__ == "__main__":
