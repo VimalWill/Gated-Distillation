@@ -55,8 +55,19 @@ def measure_accuracy(model, tokenizer, device, num_samples=200):
     return correct / total if total > 0 else 0.0
 
 
+def get_layer_prefix(model):
+    """Return the parameter name prefix used for transformer layers in this model."""
+    for name, _ in model.named_parameters():
+        if "gpt_neox.layers." in name:
+            return "gpt_neox.layers."
+        if "model.layers." in name:
+            return "model.layers."
+    raise ValueError(f"Cannot detect layer prefix for {type(model).__name__}")
+
+
 def measure_gradient_norms(model, tokenizer, dataset, device, num_samples=16):
     """Run gradient ascent backward on num_samples and return mean grad norm per layer."""
+    prefix = get_layer_prefix(model)
     model.zero_grad()
     layer_grads = {}
 
@@ -76,8 +87,8 @@ def measure_gradient_norms(model, tokenizer, dataset, device, num_samples=16):
             (-loss).backward()
 
     for name, param in model.named_parameters():
-        if param.grad is not None and "gpt_neox.layers." in name:
-            layer_idx = int(name.split("gpt_neox.layers.")[1].split(".")[0])
+        if param.grad is not None and prefix in name:
+            layer_idx = int(name.split(prefix)[1].split(".")[0])
             layer_grads.setdefault(layer_idx, []).append(param.grad.norm().item())
 
     model.zero_grad()
@@ -147,10 +158,11 @@ def train_model(
     print("Gradient flow + accuracy data saved to gradient_flow.json")
 
     # Step 2: freeze layers 0–9 and 25–31; only train layers 10–24
+    layer_prefix = get_layer_prefix(model)
     for name, param in model.named_parameters():
         param.requires_grad = False  # default: freeze everything
-        if "gpt_neox.layers." in name:
-            layer_idx = int(name.split("gpt_neox.layers.")[1].split(".")[0])
+        if layer_prefix in name:
+            layer_idx = int(name.split(layer_prefix)[1].split(".")[0])
             if TRAIN_START <= layer_idx <= TRAIN_END:
                 param.requires_grad = True
     print(f"Frozen: layers 0–{TRAIN_START-1} and {TRAIN_END+1}–{num_layers-1} + embeddings")
@@ -282,8 +294,16 @@ def train_model(
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="EleutherAI/pythia-2.8b",
+                        help="HuggingFace model name (e.g. meta-llama/Llama-2-7b-hf)")
+    parser.add_argument("--save_path", default="trained_model")
+    args = parser.parse_args()
+
     train_model(
-        model_name="EleutherAI/pythia-2.8b",
+        model_name=args.model,
+        save_path=args.save_path,
         dataset_length=64,
         epochs=1,
         lr=1e-5,
