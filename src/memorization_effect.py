@@ -129,28 +129,39 @@ def print_delta_table(baseline, unlearned):
 
 
 def main():
-    LENGTH = 64
-    dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{LENGTH}")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",      default="EleutherAI/pythia-2.8b",
+                        help="Baseline model (e.g. meta-llama/Llama-2-7b-hf)")
+    parser.add_argument("--ref_model",  default="EleutherAI/pythia-160m",
+                        help="Smaller reference model for Smaller-Ref metric")
+    parser.add_argument("--save_path",  default="trained_model",
+                        help="Path to the unlearned model checkpoint")
+    parser.add_argument("--length",     default=64, type=int,
+                        help="WikiMIA dataset length split (32, 64, 128, 256)")
+    args = parser.parse_args()
 
-    original_model_name = "EleutherAI/pythia-2.8b"
-    small_model_name    = "EleutherAI/pythia-160m"
-    trained_model_path  = "trained_model"
+    dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{args.length}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    print(f"\nLoading smaller reference model ({small_model_name})...")
-    ref_tokenizer = AutoTokenizer.from_pretrained(small_model_name)
-    ref_model = AutoModelForCausalLM.from_pretrained(small_model_name, torch_dtype=torch.float16)
+    print(f"\nLoading reference model ({args.ref_model})...")
+    ref_tokenizer = AutoTokenizer.from_pretrained(args.ref_model)
+    if ref_tokenizer.pad_token is None:
+        ref_tokenizer.pad_token = ref_tokenizer.eos_token
+    ref_model = AutoModelForCausalLM.from_pretrained(args.ref_model, torch_dtype=torch.float16)
     ref_model = ref_model.to(device)
     ref_model.eval()
 
-    # --- Original model ---
+    # --- Original / baseline model ---
     print("\n" + "="*50)
-    print("Original Model (pythia-2.8b)")
+    print(f"Original Model ({args.model})")
     print("="*50)
-    tokenizer = AutoTokenizer.from_pretrained(original_model_name)
-    model = AutoModelForCausalLM.from_pretrained(original_model_name, torch_dtype=torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16)
     model = model.to(device)
     model.eval()
     baseline = estimate_memorization(model, dataset, tokenizer, ref_model, ref_tokenizer)
@@ -159,10 +170,12 @@ def main():
 
     # --- Unlearned model ---
     print("\n" + "="*50)
-    print("Unlearned Model")
+    print(f"Unlearned Model ({args.save_path})")
     print("="*50)
-    tokenizer = AutoTokenizer.from_pretrained(trained_model_path)
-    model = AutoModelForCausalLM.from_pretrained(trained_model_path, torch_dtype=torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(args.save_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.save_path, torch_dtype=torch.float16)
     model = model.to(device)
     model.eval()
     unlearned = estimate_memorization(model, dataset, tokenizer, ref_model, ref_tokenizer)
