@@ -21,15 +21,17 @@ from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from pruner import prune_l1_unstructured
+from pruner import prune_l1_unstructured, prune_wanda, prune_global_l1_unstructured
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_NAME     = "EleutherAI/pythia-2.8b"
 REF_MODEL_NAME = "EleutherAI/pythia-160m"
 DATASET_LENGTH = 64
 PRUNE_RATIOS   = [0.05, 0.10, 0.15]
+PRUNE_METHODS  = ["l1_unstructured", "wanda", "global_l1"]
 OUTPUT_FILE    = "pruning_memorization_results.json"
 MAX_LENGTH     = 2048
+CALIBRATION_SAMPLES = 32  # Calibration samples for Wanda
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -73,6 +75,31 @@ def safe_auc(scores, labels):
     if len(set(labels)) < 2:
         return 0.5
     return float(roc_auc_score(labels, scores))
+
+
+def apply_pruning_method(model, tokenizer, dataset, method, prune_ratio, layer_start=0, layer_end=None):
+    """Apply the specified pruning method to the model.
+
+    Args:
+        model: The model to prune.
+        tokenizer: Tokenizer for the model.
+        dataset: Full dataset (used for Wanda calibration).
+        method: One of ["l1_unstructured", "wanda", "global_l1"].
+        prune_ratio: Fraction of weights to prune.
+        layer_start, layer_end: Layer range for pruning.
+    """
+    if method == "l1_unstructured":
+        prune_l1_unstructured(model, prune_ratio=prune_ratio,
+                              layer_start=layer_start, layer_end=layer_end)
+    elif method == "wanda":
+        calibration_texts = [ex["input"] for ex in dataset.take(CALIBRATION_SAMPLES)]
+        prune_wanda(model, tokenizer, calibration_texts, prune_ratio=prune_ratio,
+                    layer_start=layer_start, layer_end=layer_end)
+    elif method == "global_l1":
+        prune_global_l1_unstructured(model, prune_ratio=prune_ratio,
+                                     layer_start=layer_start, layer_end=layer_end)
+    else:
+        raise ValueError(f"Unknown pruning method: {method}")
 
 
 # ── Core evaluation ───────────────────────────────────────────────────────────
@@ -177,42 +204,45 @@ def main():
     del model; torch.cuda.empty_cache()
     save_incremental(all_results, OUTPUT_FILE)
 
-    # ── 2. Global pruning ─────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PART 2: Global pruning (all layers at once)")
-    print("="*60)
-    for ratio in PRUNE_RATIOS:
-        pct = int(ratio * 100)
-        key = f"Global {pct}%"
-        print(f"\n[{key}] pruning all {num_layers} layers at {pct}%...")
-        model, tok = load_model(MODEL_NAME, device)
-        prune_l1_unstructured(model, prune_ratio=ratio, layer_start=0)
-        all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
-        print_table({key: all_results[key]})
-        del model; torch.cuda.empty_cache()
-        save_incremental(all_results, OUTPUT_FILE)
+    # ── 2–4. Global & block-wise pruning for each method ──────────────────────
+    for method_idx, method in enumerate(PRUNE_METHODS):
+        part_num = method_idx + 2
+        print("\n" + "="*60)
+        print(f"PART {part_num}: {method.upper()} pruning")
+        print("="*60)
 
-    # ── 3. Block-wise cumulative pruning ──────────────────────────────────────
-    print("\n" + "="*60)
-    print("PART 3: Block-wise cumulative pruning")
-    print("  Load model once per ratio; prune one additional layer per step.")
-    print("="*60)
-    for ratio in PRUNE_RATIOS:
-        pct = int(ratio * 100)
-        print(f"\n  Ratio = {pct}%  — loading fresh model...")
-        model, tok = load_model(MODEL_NAME, device)
-
-        for layer_idx in range(num_layers):
-            # Prune only this layer (incrementally accumulates 0..layer_idx)
-            prune_l1_unstructured(model, prune_ratio=ratio,
-                                  layer_start=layer_idx, layer_end=layer_idx)
-            key = f"Block {pct}% L0-{layer_idx:02d}"
-            print(f"\n  [{key}] layers 0–{layer_idx} pruned at {pct}%")
+        # Global pruning
+        print(f"\n[PART {part_num}a] Global pruning (all layers at once)")
+        for ratio in PRUNE_RATIOS:
+            pct = int(ratio * 100)
+            key = f"Global {pct}% {method}"
+            print(f"\n[{key}] pruning all {num_layers} layers at {pct}%...")
+            model, tok = load_model(MODEL_NAME, device)
+            apply_pruning_method(model, tok, dataset, method, prune_ratio=ratio, layer_start=0)
             all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
             print_table({key: all_results[key]})
+            del model; torch.cuda.empty_cache()
             save_incremental(all_results, OUTPUT_FILE)
 
-        del model; torch.cuda.empty_cache()
+        # Block-wise cumulative pruning
+        print(f"\n[PART {part_num}b] Block-wise cumulative pruning ({method})")
+        print("  Load model once per ratio; prune one additional layer per step.")
+        for ratio in PRUNE_RATIOS:
+            pct = int(ratio * 100)
+            print(f"\n  Ratio = {pct}%  — loading fresh model...")
+            model, tok = load_model(MODEL_NAME, device)
+
+            for layer_idx in range(num_layers):
+                # Prune only this layer (incrementally accumulates 0..layer_idx)
+                apply_pruning_method(model, tok, dataset, method, prune_ratio=ratio,
+                                     layer_start=layer_idx, layer_end=layer_idx)
+                key = f"Block {pct}% L0-{layer_idx:02d} {method}"
+                print(f"\n  [{key}] layers 0–{layer_idx} pruned at {pct}%")
+                all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
+                print_table({key: all_results[key]})
+                save_incremental(all_results, OUTPUT_FILE)
+
+            del model; torch.cuda.empty_cache()
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n\n" + "="*60)

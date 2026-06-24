@@ -330,3 +330,138 @@ def prune_l1_unstructured(model, prune_ratio=0.05, layer_start=0, layer_end=None
 
         if targets:
             print(f"Pruned {name}: {prune_ratio*100:.0f}% weights zeroed (L1 unstructured)")
+
+
+def prune_wanda(model, tokenizer, calibration_texts, prune_ratio=0.10,
+                 layer_start=0, layer_end=None, max_length=512, device=None):
+    """Prune attention Q/K/V weights with Wanda (Sun et al., 2023).
+
+    Importance of each weight is |weight| * ||input activation||_2, where the
+    activation norm is collected from a calibration forward pass. Pruning the
+    lowest-importance weights per output row (rather than globally by raw
+    magnitude) accounts for which input features the layer actually relies on,
+    which is why Wanda beats plain magnitude/L1 pruning at the same sparsity.
+
+    Args:
+        model: The model to prune.
+        tokenizer: Tokenizer matching the model, used to encode calibration_texts.
+        calibration_texts: Iterable of strings used to estimate activation norms.
+        prune_ratio: Fraction of weights to zero per output row (0.0 to 1.0).
+        layer_start, layer_end: Restrict pruning to layers[layer_start..layer_end].
+        max_length: Truncation length for calibration forward passes.
+        device: Device to run calibration on; defaults to the model's device.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    targets = []
+    for name, module in model.named_modules():
+        if "layers." in name:
+            try:
+                layer_idx = int(name.split("layers.")[1].split(".")[0])
+                if layer_idx < layer_start:
+                    continue
+                if layer_end is not None and layer_idx > layer_end:
+                    continue
+            except (IndexError, ValueError):
+                pass
+
+        if hasattr(module, 'query_key_value'):
+            targets.append((f"{name}.query_key_value", module.query_key_value))
+        elif hasattr(module, 'q_proj'):
+            targets.append((f"{name}.q_proj", module.q_proj))
+            targets.append((f"{name}.k_proj", module.k_proj))
+            targets.append((f"{name}.v_proj", module.v_proj))
+        elif hasattr(module, 'c_attn'):
+            targets.append((f"{name}.c_attn", module.c_attn))
+        elif hasattr(module, 'attention') and hasattr(module.attention, 'query'):
+            targets.append((f"{name}.attention.query", module.attention.query))
+            targets.append((f"{name}.attention.key", module.attention.key))
+            targets.append((f"{name}.attention.value", module.attention.value))
+
+    if not targets:
+        print("No supported attention layers found for Wanda pruning")
+        return
+
+    act_sq_sum = {linear: torch.zeros(linear.in_features, device=device) for _, linear in targets}
+
+    def make_hook(linear):
+        def hook(_module, inputs):
+            x = inputs[0].detach().reshape(-1, inputs[0].size(-1)).float()
+            act_sq_sum[linear] += (x ** 2).sum(dim=0)
+        return hook
+
+    handles = [linear.register_forward_pre_hook(make_hook(linear)) for _, linear in targets]
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for text in calibration_texts:
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            model(**inputs)
+    model.train(was_training)
+
+    for h in handles:
+        h.remove()
+
+    for name, linear in targets:
+        act_norm = torch.sqrt(act_sq_sum[linear] + 1e-12)
+        importance = linear.weight.data.abs() * act_norm.unsqueeze(0)
+        num_prune = int(prune_ratio * linear.in_features)
+        if num_prune == 0:
+            continue
+        prune_indices = torch.topk(importance, num_prune, largest=False, dim=1).indices
+        linear.weight.data.scatter_(1, prune_indices, 0.0)
+        print(f"Wanda-pruned {name}: zeroed {num_prune} weights/row ({prune_ratio*100:.0f}%) using activation-aware importance")
+
+
+def prune_global_l1_unstructured(model, prune_ratio=0.05, layer_start=0, layer_end=None):
+    """Prune attention weights with PyTorch's global L1 unstructured pruner.
+
+    Unlike prune_l1_unstructured (which prunes each layer independently at the
+    same fixed ratio), this ranks all targeted weights together and removes the
+    globally lowest-magnitude prune_ratio fraction, letting sparsity vary by
+    layer sensitivity automatically.
+    Set layer_end to restrict pruning to layers[layer_start..layer_end] inclusive.
+    """
+    parameters_to_prune = []
+    for name, module in model.named_modules():
+        if "layers." in name:
+            try:
+                layer_idx = int(name.split("layers.")[1].split(".")[0])
+                if layer_idx < layer_start:
+                    continue
+                if layer_end is not None and layer_idx > layer_end:
+                    continue
+            except (IndexError, ValueError):
+                pass
+
+        if hasattr(module, 'query_key_value'):
+            parameters_to_prune.append((module.query_key_value, 'weight'))
+        elif hasattr(module, 'q_proj'):
+            parameters_to_prune.append((module.q_proj, 'weight'))
+            parameters_to_prune.append((module.k_proj, 'weight'))
+            parameters_to_prune.append((module.v_proj, 'weight'))
+        elif hasattr(module, 'c_attn'):
+            parameters_to_prune.append((module.c_attn, 'weight'))
+        elif hasattr(module, 'attention') and hasattr(module.attention, 'query'):
+            parameters_to_prune.append((module.attention.query, 'weight'))
+            parameters_to_prune.append((module.attention.key, 'weight'))
+            parameters_to_prune.append((module.attention.value, 'weight'))
+
+    if not parameters_to_prune:
+        print("No supported attention layers found for global L1 pruning")
+        return
+
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method=prune.L1Unstructured,
+        amount=prune_ratio,
+    )
+
+    for module, param_name in parameters_to_prune:
+        prune.remove(module, param_name)
+
+    print(f"Globally pruned {len(parameters_to_prune)} weight matrices: "
+          f"{prune_ratio*100:.0f}% of total weights zeroed (global L1 unstructured)")
