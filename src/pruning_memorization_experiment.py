@@ -144,20 +144,26 @@ def evaluate(model, tokenizer, dataset, ref_model, ref_tokenizer, desc="eval"):
     }
 
 
-def evaluate_accuracy(model, tokenizer, dataset, desc="eval"):
-    """Evaluate model accuracy on a wikitext-like dataset (mean token log-prob)."""
-    log_probs = []
-    for ex in tqdm(dataset, desc=f"  {desc}", leave=False):
-        text = ex.get("text") or ex.get("input", "")
-        if not text:
-            continue
-        lp = get_token_logprobs(text, tokenizer, model)
-        if len(lp) > 0:
-            log_probs.append(lp.mean().item())
-
-    if not log_probs:
-        return 0.0
-    return float(np.mean(log_probs))
+def measure_accuracy(model, tokenizer, device, num_samples=200):
+    """Next-token accuracy on LAMBADA (0.0–1.0, higher is better)."""
+    lambada = load_dataset("EleutherAI/lambada_openai", split="test")
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for i, example in enumerate(lambada):
+            if i >= num_samples:
+                break
+            full_ids = tokenizer(example["text"], return_tensors="pt")["input_ids"][0]
+            if len(full_ids) < 2:
+                continue
+            context = full_ids[:-1].unsqueeze(0).to(device)
+            target = full_ids[-1].item()
+            logits = model(input_ids=context).logits[0, -1, :]
+            if logits.argmax().item() == target:
+                correct += 1
+            total += 1
+    model.train()
+    return correct / total if total > 0 else 0.0
 
 
 # ── Table printer ─────────────────────────────────────────────────────────────
@@ -227,7 +233,7 @@ def main():
 
     cols = COLS_BASE.copy()
     if args.accuracy:
-        cols.append(("Accuracy", "accuracy"))
+        cols.append(("Accuracy%", "accuracy"))
 
     # ── 1. Baseline ───────────────────────────────────────────────────────────
     print("\n" + "="*60)
@@ -236,7 +242,7 @@ def main():
     model, tok = load_model(MODEL_NAME, device)
     all_results["Baseline"] = evaluate(model, tok, dataset, ref_model, ref_tok, "Baseline")
     if args.accuracy:
-        all_results["Baseline"]["accuracy"] = evaluate_accuracy(model, tok, dataset, "Baseline")
+        all_results["Baseline"]["accuracy"] = measure_accuracy(model, tok, device, num_samples=200)
     print_table({"Baseline": all_results["Baseline"]}, cols=cols)
     del model; torch.cuda.empty_cache()
     save_incremental(all_results, OUTPUT_FILE)
@@ -258,7 +264,7 @@ def main():
             apply_pruning_method(model, tok, dataset, method, prune_ratio=ratio, layer_start=0)
             all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
             if args.accuracy:
-                all_results[key]["accuracy"] = evaluate_accuracy(model, tok, dataset, key)
+                all_results[key]["accuracy"] = measure_accuracy(model, tok, device, num_samples=200)
             print_table({key: all_results[key]}, cols=cols)
             del model; torch.cuda.empty_cache()
             save_incremental(all_results, OUTPUT_FILE)
@@ -280,7 +286,7 @@ def main():
                     print(f"\n  [{key}] layers 0–{layer_idx} pruned at {pct}%")
                     all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
                     if args.accuracy:
-                        all_results[key]["accuracy"] = evaluate_accuracy(model, tok, dataset, key)
+                        all_results[key]["accuracy"] = measure_accuracy(model, tok, device, num_samples=200)
                     print_table({key: all_results[key]}, cols=cols)
                     save_incremental(all_results, OUTPUT_FILE)
 
