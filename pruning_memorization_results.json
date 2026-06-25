@@ -1,0 +1,62 @@
+{
+  "Baseline": {
+    "roc_auc": 0.611911780762092,
+    "mink_member": -6.601882554275889,
+    "mink_nonmember": -7.00144468351852,
+    "mink_gap": 0.39956212924263124,
+    "ppl_auc": 0.5845889289223715,
+    "lowercase_auc": 0.5773692542854023,
+    "zlib_auc": 0.6056474505950431,
+    "smaller_ref_auc": 0.6201959820941151
+  },
+  "Global 5% l1_unstructured": {
+    "roc_auc": 0.6120619063216508,
+    "mink_member": -6.586289312638027,
+    "mink_nonmember": -6.98639870798865,
+    "mink_gap": 0.40010939535062295,
+    "ppl_auc": 0.5844933944753794,
+    "lowercase_auc": 0.5769871164974343,
+    "zlib_auc": 0.605510972813626,
+    "smaller_ref_auc": 0.6203597554318158
+  },
+  "Global 10% l1_unstructured": {
+    "roc_auc": 0.6072169450813407,
+    "mink_member": -6.6121410727500916,
+    "mink_nonmember": -6.991621132044829,
+    "mink_gap": 0.37948005929473716,
+    "ppl_auc": 0.5846844633693635,
+    "lowercase_auc": 0.5755268042362703,
+    "zlib_auc": 0.6061660661644285,
+    "smaller_ref_auc": 0.6226798777159078
+  },
+  "Global 15% l1_unstructured": {
+    "roc_auc": 0.5972267714816029,
+    "mink_member": -6.6359441632955845,
+    "mink_nonmember": -6.966177655744922,
+    "mink_gap": 0.330233492449338,
+    "ppl_auc": 0.5786112020962988,
+    "lowercase_auc": 0.5739027186374058,
+    "zlib_auc": 0.6016350038213779,
+    "smaller_ref_auc": 0.6118162463150999
+  },
+  "Block 5% L0-00 l1_unstructured": {
+    "roc_auc": 0.6120209629872257,
+    "mink_member": -6.602214082865648,
+    "mink_nonmember": -7.001624654429827,
+    "mink_gap": 0.3994105715641796,
+    "ppl_auc": 0.5844933944753794,
+    "lowercase_auc": 0.5772054809477016,
+    "zlib_auc": 0.60570204170761,
+    "smaller_ref_auc": 0.6200867998689813
+  },
+  "Block 5% L0-01 l1_unstructured": {
+    "roc_auc": 0.6116524729773992,
+    "mink_member": -6.6023164441887765,
+    "mink_nonmember": -7.0017677222111425,
+    "mink_gap": 0.399451278022366,
+    "ppl_auc": 0.5840703133529861,
+    "lowercase_auc": 0.57719183316956,
+    "zlib_auc": 0.6054427339229174,
+    "smaller_ref_auc": 0.6200867998689812
+  }
+}

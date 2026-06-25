@@ -10,6 +10,7 @@ Metrics reported per configuration:
   PPL AUC  |  Lowercase AUC  |  Zlib AUC  |  Smaller-Ref AUC
 """
 
+import argparse
 import json
 import zlib
 
@@ -143,9 +144,25 @@ def evaluate(model, tokenizer, dataset, ref_model, ref_tokenizer, desc="eval"):
     }
 
 
+def evaluate_accuracy(model, tokenizer, dataset, desc="eval"):
+    """Evaluate model accuracy on a wikitext-like dataset (mean token log-prob)."""
+    log_probs = []
+    for ex in tqdm(dataset, desc=f"  {desc}", leave=False):
+        text = ex.get("text") or ex.get("input", "")
+        if not text:
+            continue
+        lp = get_token_logprobs(text, tokenizer, model)
+        if len(lp) > 0:
+            log_probs.append(lp.mean().item())
+
+    if not log_probs:
+        return 0.0
+    return float(np.mean(log_probs))
+
+
 # ── Table printer ─────────────────────────────────────────────────────────────
 
-COLS = [
+COLS_BASE = [
     ("ROC-AUC",  "roc_auc"),
     ("MK-Mem",   "mink_member"),
     ("MK-Non",   "mink_nonmember"),
@@ -156,14 +173,16 @@ COLS = [
     ("SmRef",    "smaller_ref_auc"),
 ]
 
-def print_table(results):
+def print_table(results, cols=None):
+    if cols is None:
+        cols = COLS_BASE
     name_w = max(len(k) for k in results) + 2
-    header = f"{'Experiment':<{name_w}}" + "".join(f"{h:>10}" for h, _ in COLS)
+    header = f"{'Experiment':<{name_w}}" + "".join(f"{h:>10}" for h, _ in cols)
     sep    = "=" * len(header)
     print(f"\n{sep}\n{header}\n{'-'*len(header)}")
     for exp_name, r in results.items():
         row = f"{exp_name:<{name_w}}"
-        for _, key in COLS:
+        for _, key in cols:
             v = r.get(key)
             row += f"{v:>10.4f}" if v is not None else f"{'N/A':>10}"
         print(row)
@@ -178,8 +197,20 @@ def save_incremental(results, path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="Pruning memorization experiment")
+    parser.add_argument("--global-only", action="store_true",
+                        help="Run only global pruning (skip block-wise cumulative)")
+    parser.add_argument("--accuracy", action="store_true",
+                        help="Include accuracy metrics in evaluation")
+    parser.add_argument("--methods", nargs="+", default=PRUNE_METHODS,
+                        help=f"Pruning methods to test (default: {' '.join(PRUNE_METHODS)})")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Global only: {args.global_only}")
+    print(f"Include accuracy: {args.accuracy}")
+    print(f"Methods: {args.methods}")
 
     dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{DATASET_LENGTH}")
     n_mem = sum(1 for x in dataset if x["label"] == 1)
@@ -194,18 +225,24 @@ def main():
 
     all_results = {}
 
+    cols = COLS_BASE.copy()
+    if args.accuracy:
+        cols.append(("Accuracy", "accuracy"))
+
     # ── 1. Baseline ───────────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("PART 1: Baseline (no pruning)")
     print("="*60)
     model, tok = load_model(MODEL_NAME, device)
     all_results["Baseline"] = evaluate(model, tok, dataset, ref_model, ref_tok, "Baseline")
-    print_table({"Baseline": all_results["Baseline"]})
+    if args.accuracy:
+        all_results["Baseline"]["accuracy"] = evaluate_accuracy(model, tok, dataset, "Baseline")
+    print_table({"Baseline": all_results["Baseline"]}, cols=cols)
     del model; torch.cuda.empty_cache()
     save_incremental(all_results, OUTPUT_FILE)
 
     # ── 2–4. Global & block-wise pruning for each method ──────────────────────
-    for method_idx, method in enumerate(PRUNE_METHODS):
+    for method_idx, method in enumerate(args.methods):
         part_num = method_idx + 2
         print("\n" + "="*60)
         print(f"PART {part_num}: {method.upper()} pruning")
@@ -220,35 +257,40 @@ def main():
             model, tok = load_model(MODEL_NAME, device)
             apply_pruning_method(model, tok, dataset, method, prune_ratio=ratio, layer_start=0)
             all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
-            print_table({key: all_results[key]})
+            if args.accuracy:
+                all_results[key]["accuracy"] = evaluate_accuracy(model, tok, dataset, key)
+            print_table({key: all_results[key]}, cols=cols)
             del model; torch.cuda.empty_cache()
             save_incremental(all_results, OUTPUT_FILE)
 
-        # Block-wise cumulative pruning
-        print(f"\n[PART {part_num}b] Block-wise cumulative pruning ({method})")
-        print("  Load model once per ratio; prune one additional layer per step.")
-        for ratio in PRUNE_RATIOS:
-            pct = int(ratio * 100)
-            print(f"\n  Ratio = {pct}%  — loading fresh model...")
-            model, tok = load_model(MODEL_NAME, device)
+        # Block-wise cumulative pruning (skip if --global-only)
+        if not args.global_only:
+            print(f"\n[PART {part_num}b] Block-wise cumulative pruning ({method})")
+            print("  Load model once per ratio; prune one additional layer per step.")
+            for ratio in PRUNE_RATIOS:
+                pct = int(ratio * 100)
+                print(f"\n  Ratio = {pct}%  — loading fresh model...")
+                model, tok = load_model(MODEL_NAME, device)
 
-            for layer_idx in range(num_layers):
-                # Prune only this layer (incrementally accumulates 0..layer_idx)
-                apply_pruning_method(model, tok, dataset, method, prune_ratio=ratio,
-                                     layer_start=layer_idx, layer_end=layer_idx)
-                key = f"Block {pct}% L0-{layer_idx:02d} {method}"
-                print(f"\n  [{key}] layers 0–{layer_idx} pruned at {pct}%")
-                all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
-                print_table({key: all_results[key]})
-                save_incremental(all_results, OUTPUT_FILE)
+                for layer_idx in range(num_layers):
+                    # Prune only this layer (incrementally accumulates 0..layer_idx)
+                    apply_pruning_method(model, tok, dataset, method, prune_ratio=ratio,
+                                         layer_start=layer_idx, layer_end=layer_idx)
+                    key = f"Block {pct}% L0-{layer_idx:02d} {method}"
+                    print(f"\n  [{key}] layers 0–{layer_idx} pruned at {pct}%")
+                    all_results[key] = evaluate(model, tok, dataset, ref_model, ref_tok, key)
+                    if args.accuracy:
+                        all_results[key]["accuracy"] = evaluate_accuracy(model, tok, dataset, key)
+                    print_table({key: all_results[key]}, cols=cols)
+                    save_incremental(all_results, OUTPUT_FILE)
 
-            del model; torch.cuda.empty_cache()
+                del model; torch.cuda.empty_cache()
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n\n" + "="*60)
     print("FULL RESULTS SUMMARY")
     print("="*60)
-    print_table(all_results)
+    print_table(all_results, cols=cols)
 
     save_incremental(all_results, OUTPUT_FILE)
     print(f"\nAll results saved to {OUTPUT_FILE}")
