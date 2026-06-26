@@ -56,7 +56,7 @@ class SPEUnlearning:
                     k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()
                 }
-                outputs = self.model(**{k: v for k, v in batch.items() if k != "labels"})
+                outputs = self.model(**batch)
                 loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
 
                 grads = torch.autograd.grad(
@@ -110,7 +110,7 @@ class SPEUnlearning:
                     k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()
                 }
-                outputs = self.model(**{k: v for k, v in batch.items() if k != "labels"})
+                outputs = self.model(**batch)
                 loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
 
                 batch_grads = torch.autograd.grad(

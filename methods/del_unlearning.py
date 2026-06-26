@@ -26,11 +26,12 @@ class DELUnlearning:
         top_h: int = 5,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute per-output-channel criticality: mean of top-h |θ·∇ℓ| scores per channel.
+        Compute per-output-channel criticality: mean of top-h |Σ_B θ_j · g_j(B)| per channel.
 
         Paper Algorithm 1 (Appendix A.5):
-            s_j = |θ_j · g_j(θ, S)|
-            c_oi = (1/h) * Σ top-h s_i[j] per output channel
+            s_j = Σ_B θ_j · g_j(θ, B)        (signed sum across batches)
+            s_j ← |s_j|                       (magnitude taken once)
+            c_oi = (1/h) · Σ top-h s_i[j]    (per output channel)
         """
         if layer_names is None:
             layer_names = self._get_target_layers()
@@ -50,16 +51,22 @@ class DELUnlearning:
                 for k, v in batch.items()
             }
             self.model.zero_grad()
-            outputs = self.model(**{k: v for k, v in batch.items() if k != "labels"})
+            outputs = self.model(**batch)
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             loss.backward()
 
+            # DEL-2 fix: accumulate signed theta·grad across batches; take magnitude once after.
             with torch.no_grad():
                 for name, param in self.model.named_parameters():
                     if name in score_accum and param.grad is not None:
-                        score_accum[name].add_(torch.abs(param.data * param.grad))
+                        score_accum[name].add_(param.data * param.grad)
 
         self.model.zero_grad()
+
+        # DEL-2 fix: |s_j| applied once after the loop, per Algorithm 1 line 4.
+        with torch.no_grad():
+            for name in score_accum:
+                score_accum[name].abs_()
 
         # D3 fix: aggregate to output-channel level using mean of top-h scores per channel
         criticality: Dict[str, torch.Tensor] = {}
@@ -82,21 +89,43 @@ class DELUnlearning:
         budget_alpha: float = 0.25,
     ) -> Dict[str, torch.Tensor]:
         """
-        Select top-budget output channels by criticality, mark their full rows.
+        Greedy-fill mask in descending criticality order until the running param
+        count reaches budget_alpha * total_params, marking whole output channels
+        (rows of 2-D weights, individual bias elements for 1-D).
 
-        Budget is fraction of total output channels, not individual weights (D3 fix).
+        budget_alpha is the parameter-fraction budget, matching paper Algorithm 1
+        line 6: |m|_1 ≤ p · α. Each output channel contributes its full row of
+        weights (or one bias element) to the running count.
         """
-        total_channels = sum(s.numel() for s in criticality_scores.values())
-        budget = int(budget_alpha * total_channels)
+        # DEL-3 fix: budget is parameter-fraction, not channel-fraction.
+        # Compute per-channel param count and total targeted params up front.
+        param_dict = {n: p for n, p in self.model.named_parameters()}
 
-        all_channels = [
-            (criticality_scores[name][ch].item(), name, ch)
-            for name in criticality_scores
-            for ch in range(criticality_scores[name].numel())
-        ]
-        all_channels.sort(key=lambda x: x[0], reverse=True)
-        selected = {(name, ch) for _, name, ch in all_channels[:budget]}
+        channel_info = []  # (score, name, channel_idx, param_count_for_this_channel)
+        for name, scores in criticality_scores.items():
+            param = param_dict[name]
+            if param.dim() >= 2:
+                row_size = param.numel() // param.shape[0]
+            else:
+                row_size = 1
+            for ch in range(scores.numel()):
+                channel_info.append((scores[ch].item(), name, ch, row_size))
+        channel_info.sort(key=lambda x: x[0], reverse=True)
 
+        total_params = sum(
+            p.numel() for n, p in self.model.named_parameters() if n in criticality_scores
+        )
+        target_params = int(budget_alpha * total_params)
+
+        selected: set = set()
+        running = 0
+        for _, name, ch, sz in channel_info:
+            if running + sz > target_params:
+                break
+            selected.add((name, ch))
+            running += sz
+
+        # Build per-parameter masks: mark full rows for 2-D, single elements for 1-D.
         masks: Dict[str, torch.Tensor] = {}
         for name, param in self.model.named_parameters():
             if name not in criticality_scores:
@@ -104,7 +133,7 @@ class DELUnlearning:
             mask = torch.zeros_like(param, dtype=torch.bool, device=self.device)
             for ch in range(param.shape[0]):
                 if (name, ch) in selected:
-                    mask[ch] = True  # marks entire row for 2-D; element for 1-D
+                    mask[ch] = True
             masks[name] = mask
 
         return masks
@@ -150,13 +179,21 @@ class DELUnlearning:
         optimizer_class=torch.optim.Adam,
     ):
         """
-        Finetune only masked entries on the retain set.
+        Finetune only masked entries on the retain set, plus the classifier head.
 
         D5 fix: after backward, zero gradient at unmasked positions inside masked
         parameters so those entries are not updated by optimizer.step().
+
+        DEL-CLS fix: classifier-layer params (matched by name) are finetuned
+        fully — paper's RFT finetunes masked params AND the classifier head on
+        the retain set; without this the comparison is asymmetric.
         """
-        for name, param in self.model.named_parameters():
-            param.requires_grad = name in mask and bool(mask[name].any())
+        # Names containing 'classifier' bypass gradient-zeroing entirely.
+        # Keep requires_grad=True on all params so the forward graph is intact
+        # (params outside the mask would otherwise break backward when used in
+        # the forward pass — e.g. classifier head on a real HF model).
+        for param in self.model.parameters():
+            param.requires_grad = True
 
         optimizer = optimizer_class(
             [p for p in self.model.parameters() if p.requires_grad],
@@ -172,14 +209,23 @@ class DELUnlearning:
                     for k, v in batch.items()
                 }
                 optimizer.zero_grad()
-                outputs = self.model(**{k: v for k, v in batch.items() if k != "labels"})
+                outputs = self.model(**batch)
                 loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
                 loss.backward()
 
-                # D5 fix: zero gradient at unmasked positions within masked parameters
+                # D5 fix: zero gradient at unmasked positions within masked parameters,
+                # and zero gradients of parameters outside the mask entirely so
+                # optimizer.step() is a no-op for them.
+                # DEL-CLS exception: classifier params update fully (no gradient zero).
                 for name, param in self.model.named_parameters():
-                    if param.grad is not None and name in mask:
+                    if param.grad is None:
+                        continue
+                    if "classifier" in name.lower():
+                        continue  # let classifier params update freely
+                    if name in mask:
                         param.grad[~mask[name]] = 0.0
+                    else:
+                        param.grad.zero_()
 
                 optimizer.step()
                 total_loss += loss.item()
@@ -202,10 +248,11 @@ class DELUnlearning:
         print("[DEL] Computing criticality scores...")
         self.compute_criticality_scores(forget_loader, top_h=top_h)
 
-        print(f"[DEL] Generating channel mask (α={budget_alpha})...")
+        print(f"[DEL] Generating mask (parameter-budget α={budget_alpha})...")
         mask = self.generate_mask(self.criticality_scores, budget_alpha)
         n_params = int(sum(m.sum().item() for m in mask.values()))
-        print(f"[DEL] Resetting {n_params} parameters...")
+        total_targeted = sum(p.numel() for n, p in self.model.named_parameters() if n in self.criticality_scores)
+        print(f"[DEL] Resetting {n_params}/{total_targeted} targeted parameters ({n_params/max(total_targeted,1):.1%})...")
         self.reset_parameters(mask)
 
         print("[DEL] Finetuning masked parameters on retain set...")
