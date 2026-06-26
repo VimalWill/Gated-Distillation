@@ -63,6 +63,7 @@ class SPEUnlearning:
                     loss,
                     [p for _, p in target_params],
                     create_graph=False,
+                    allow_unused=True,
                 )
                 with torch.no_grad():
                     for (name, _), grad in zip(target_params, grads):
@@ -116,6 +117,7 @@ class SPEUnlearning:
                     loss,
                     [p for _, p in target_params],
                     create_graph=False,
+                    allow_unused=True,
                 )
                 with torch.no_grad():
                     for (name, _), grad in zip(target_params, batch_grads):
@@ -158,10 +160,15 @@ class SPEUnlearning:
         sparsity: float = 0.9,
     ) -> Dict[str, torch.Tensor]:
         """
-        Select the least-important output neurons to update; freeze the rest.
+        Select the most-important output neurons to update; freeze the rest.
 
         sparsity = fraction of structural units to freeze.
         (1 - sparsity) fraction receives the Newton update.
+
+        Direction (paper Algorithm 1, lines 12-16): unimportant structures get
+        m=0 (frozen); the high-importance structures keep m=1 and receive the
+        update θ += η · m ∘ Î⁻¹ gθ. Influence-critical structures are the ones
+        modified, not the least-critical ones.
 
         S5 fix: granularity is output neurons (rows of weight matrices), not
         individual weights. Row-level importance = mean score across each row.
@@ -178,13 +185,13 @@ class SPEUnlearning:
         total_neurons = sum(s.numel() for s in row_scores.values())
         update_budget = int((1 - sparsity) * total_neurons)
 
-        # Rank neurons ascending: lowest importance → update first
+        # Rank neurons descending: highest importance → update first (paper lines 13-16)
         all_neurons = [
             (row_scores[name][idx].item(), name, idx)
             for name in row_scores
             for idx in range(row_scores[name].numel())
         ]
-        all_neurons.sort(key=lambda x: x[0])
+        all_neurons.sort(key=lambda x: x[0], reverse=True)
         update_set = {(name, idx) for _, name, idx in all_neurons[:update_budget]}
 
         # Build parameter-level masks: 1.0 = update this row, 0.0 = freeze
