@@ -17,9 +17,14 @@ DEL/SPE are restricted to the attention Q/K/V matrices — the same matrices the
 pruning experiments and train_model.py's pruning step operate on — so the
 comparison is on identical parameters.
 
+The head-to-head is: our method (--checkpoint) vs DEL vs SPE. Our method is
+members-only (ascent + KL); DEL and SPE additionally use the retain set (DEL's
+finetune step, SPE's Fisher term). Pruning baselines remain in METHODS but are
+not run by default.
+
 Example:
   python src/compare_unlearning.py --length 64 \
-      --methods del spe l1_unstructured wanda --checkpoint trained_model
+      --methods del spe --checkpoint trained_model
 """
 
 import argparse
@@ -133,7 +138,9 @@ def main():
     ap.add_argument("--model", default="EleutherAI/pythia-2.8b")
     ap.add_argument("--ref_model", default="EleutherAI/pythia-160m")
     ap.add_argument("--length", type=int, default=64, help="WikiMIA length split")
-    ap.add_argument("--methods", nargs="+", default=["del", "spe", "l1_unstructured"],
+    # Focus comparison: our method (via --checkpoint) vs DEL vs SPE.
+    # Pruning baselines stay available in METHODS but are not run by default.
+    ap.add_argument("--methods", nargs="+", default=["del", "spe"],
                     choices=list(METHODS))
     ap.add_argument("--checkpoint", default=None,
                     help="Optional path to the gated-distillation checkpoint to include")
