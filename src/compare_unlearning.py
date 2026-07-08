@@ -31,6 +31,7 @@ import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from datasets import load_dataset
@@ -41,7 +42,9 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)   # memorization_effect, pruner
 sys.path.insert(0, ROOT)   # methods package
 
-from memorization_effect import estimate_memorization, print_table, print_delta_table
+from memorization_effect import (
+    estimate_memorization, print_table, print_delta_table, calculate_perplexity,
+)
 from pruner import prune_l1_unstructured, prune_wanda, prune_global_l1_unstructured
 from methods.del_unlearning import DELUnlearning
 from methods.spe_unlearning import SPEUnlearning
@@ -86,6 +89,27 @@ def make_loader(texts, tokenizer, batch_size, max_length):
         return dict(enc)
 
     return DataLoader(list(texts), batch_size=batch_size, shuffle=True, collate_fn=collate)
+
+
+# ── Utility (general-capability) probe ────────────────────────────────────────
+
+def load_utility_texts(n, min_chars=64):
+    """Held-out wikitext-2 test lines — a corpus none of the methods train on.
+
+    Serves as the clean utility signal: a faithful unlearning method should
+    barely move perplexity here, while a method that merely broke the model
+    will spike it.
+    """
+    wt = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    texts = [t.strip() for t in wt["text"] if len(t.strip()) >= min_chars]
+    return texts[:n]
+
+
+def utility_perplexity(model, tokenizer, texts, max_length):
+    """Mean held-out perplexity (lower = better; should stay near baseline)."""
+    ppls = [calculate_perplexity(t, model, tokenizer, max_length=max_length) for t in texts]
+    ppls = [p for p in ppls if np.isfinite(p)]
+    return float(np.mean(ppls)) if ppls else float("nan")
 
 
 # ── Method registry (each mutates `model` in place) ───────────────────────────
@@ -153,6 +177,8 @@ def main():
     ap.add_argument("--sparsity", type=float, default=0.9, help="SPE freeze fraction")
     ap.add_argument("--spe_lr", type=float, default=1e-6)
     ap.add_argument("--prune_ratio", type=float, default=0.10)
+    ap.add_argument("--n_utility", type=int, default=64,
+                    help="# held-out wikitext-2 lines for the utility PPL probe")
     ap.add_argument("--fp32", action="store_true", help="Use float32 (default float16)")
     args = ap.parse_args()
 
@@ -167,6 +193,10 @@ def main():
     print(f"WikiMIA length{args.length}: {len(forget_texts)} members (forget), "
           f"{len(retain_texts)} non-members (retain)")
 
+    # Held-out utility corpus (no method trains on it) — the general-capability probe.
+    utility_texts = load_utility_texts(args.n_utility)
+    print(f"Utility probe: {len(utility_texts)} held-out wikitext-2 lines")
+
     # Shared tokenizer + reference model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
@@ -177,11 +207,13 @@ def main():
     ref_model = load_model(args.ref_model, device, dtype).eval()
 
     results = {}
+    utility = {}
 
     # Baseline
     print("\n=== Baseline ===")
     model = load_model(args.model, device, dtype).eval()
     results["Baseline"] = estimate_memorization(model, full, tokenizer, ref_model, ref_tok)
+    utility["Baseline"] = utility_perplexity(model, tokenizer, utility_texts, args.max_length)
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -204,6 +236,7 @@ def main():
 
             model.eval()
             results[key] = estimate_memorization(model, full, tokenizer, ref_model, ref_tok)
+            utility[key] = utility_perplexity(model, tokenizer, utility_texts, args.max_length)
         except Exception as e:
             failed[key] = f"{type(e).__name__}: {e}"
             print(f"  [skipped {key}] {failed[key]}")
@@ -220,6 +253,7 @@ def main():
             ck_tok.pad_token = ck_tok.eos_token
         model = load_model(args.checkpoint, device, dtype).eval()
         results["OurMethod"] = estimate_memorization(model, full, ck_tok, ref_model, ref_tok)
+        utility["OurMethod"] = utility_perplexity(model, ck_tok, utility_texts, args.max_length)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -235,6 +269,18 @@ def main():
             continue
         print(f"\nDelta ({name} − Baseline)")
         print_delta_table(baseline, r)
+
+    # Utility panel: held-out PPL a faithful method should leave near baseline.
+    # A big positive Δ means the method broke general capability, not just forgot.
+    print("\n" + "=" * 60)
+    print("UTILITY — held-out wikitext-2 perplexity (lower = better)")
+    base_ppl = utility.get("Baseline", float("nan"))
+    print(f"\n{'Model':<12}{'PPL':>12}{'Δ vs base':>14}")
+    print("-" * 38)
+    for name, ppl in utility.items():
+        delta = ppl - base_ppl
+        tag = "" if name == "Baseline" else f"{delta:>+14.3f}"
+        print(f"{name:<12}{ppl:>12.3f}{tag}")
 
     if failed:
         print("\nSkipped methods:")
