@@ -125,7 +125,9 @@ def apply_del(model, tokenizer, forget_loader, retain_loader, calib_texts, devic
 def apply_spe(model, tokenizer, forget_loader, retain_loader, calib_texts, device, attn_names, args):
     SPEUnlearning(model, device).unlearn(
         retain_loader, forget_loader,
-        sparsity=args.sparsity, learning_rate=args.spe_lr, layer_names=attn_names,
+        sparsity=args.sparsity, learning_rate=args.spe_lr,
+        damping=args.spe_damping, max_update=args.spe_max_update,
+        layer_names=attn_names,
     )
 
 
@@ -176,6 +178,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--sparsity", type=float, default=0.9, help="SPE freeze fraction")
     ap.add_argument("--spe_lr", type=float, default=1e-6)
+    ap.add_argument("--spe_damping", type=float, default=1e-2,
+                    help="SPE Fisher damping λ = damping·mean(Î); higher = safer/smaller steps")
+    ap.add_argument("--spe_max_update", type=float, default=1.0,
+                    help="SPE per-element update clamp (hard guard against blow-up)")
     ap.add_argument("--prune_ratio", type=float, default=0.10)
     ap.add_argument("--n_utility", type=int, default=64,
                     help="# held-out wikitext-2 lines for the utility PPL probe")
@@ -275,12 +281,16 @@ def main():
     print("\n" + "=" * 60)
     print("UTILITY — held-out wikitext-2 perplexity (lower = better)")
     base_ppl = utility.get("Baseline", float("nan"))
-    print(f"\n{'Model':<12}{'PPL':>12}{'Δ vs base':>14}")
-    print("-" * 38)
+    def fmt(x):
+        # Switch to scientific notation once a method has blown the model up,
+        # so a 1e14 collapse can't run into the neighbouring column.
+        return f"{x:.3f}" if abs(x) < 1e6 else f"{x:.3e}"
+
+    print(f"\n{'Model':<12}{'PPL':>14}{'Δ vs base':>16}")
+    print("-" * 42)
     for name, ppl in utility.items():
-        delta = ppl - base_ppl
-        tag = "" if name == "Baseline" else f"{delta:>+14.3f}"
-        print(f"{name:<12}{ppl:>12.3f}{tag}")
+        tag = "" if name == "Baseline" else f"{('+' if ppl >= base_ppl else '')}{fmt(ppl - base_ppl)}"
+        print(f"{name:<12}{fmt(ppl):>14}{tag:>16}")
 
     if failed:
         print("\nSkipped methods:")

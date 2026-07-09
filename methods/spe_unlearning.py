@@ -213,22 +213,39 @@ class SPEUnlearning:
         self,
         mask: Dict[str, torch.Tensor],
         learning_rate: float = 1e-6,
+        damping: float = 1e-2,
         epsilon: float = 1e-8,
+        max_update: Optional[float] = 1.0,
     ):
         """
-        Apply sparse Newton step: θ += η · m ⊙ (Î^{-1} · g_θ)
+        Apply sparse damped Newton step: θ += η · m ⊙ (Î + λI)^{-1} · g_θ
 
-        S6 fix: use in-place .add_() instead of .data reassignment to avoid
-        breaking optimizer state and forward hooks.
+        S-DAMP fix: the raw inverse-Fisher 1/(Î+ε) blows up wherever the Fisher
+        diagonal is near zero, so even a tiny learning rate produces enormous
+        steps that destroy the model (observed: held-out PPL → 1e14). λ is set
+        per layer to `damping · mean(Î)`, a Tikhonov/Levenberg–Marquardt term
+        that bounds the amplification to ≈1/(damping·mean Î) and keeps the step
+        scale-aware. Each element is then clamped to ±max_update as a hard guard.
+
+        S6 fix: in-place .add_() instead of .data reassignment so optimizer
+        state and forward hooks aren't broken.
         """
+        total_sq, n_elem = 0.0, 0
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name not in mask or name not in self.fim_diag:
                     continue
-                fim_inv = 1.0 / (self.fim_diag[name] + epsilon)
-                update = self.forget_grads[name] * fim_inv
-                # S6 fix: in-place mutation, not param.data = param.data + ...
-                param.data.add_(learning_rate * mask[name] * update)
+                fim = self.fim_diag[name]
+                lam = damping * fim.mean() + epsilon      # scale-aware damping
+                fim_inv = 1.0 / (fim + lam)
+                update = learning_rate * mask[name] * (self.forget_grads[name] * fim_inv)
+                if max_update is not None:
+                    update.clamp_(-max_update, max_update)
+                param.data.add_(update)
+                total_sq += float((update ** 2).sum())
+                n_elem += update.numel()
+        if n_elem:
+            print(f"[SPE] update RMS = {(total_sq / n_elem) ** 0.5:.3e}")
 
     def unlearn(
         self,
@@ -236,6 +253,8 @@ class SPEUnlearning:
         forget_loader,
         sparsity: float = 0.9,
         learning_rate: float = 1e-6,
+        damping: float = 1e-2,
+        max_update: Optional[float] = 1.0,
         layer_names: Optional[List[str]] = None,
     ):
         """Full SPE-Unlearn pipeline: importance → structural mask → sparse SO update."""
@@ -245,8 +264,10 @@ class SPEUnlearning:
         print("[SPE] Generating structural mask...")
         mask = self.generate_structural_mask(self.importance_scores, sparsity=sparsity)
 
-        print(f"[SPE] Applying sparse second-order update (lr={learning_rate})...")
-        self.sparse_second_order_update(mask, learning_rate=learning_rate)
+        print(f"[SPE] Applying sparse second-order update (lr={learning_rate}, damping={damping})...")
+        self.sparse_second_order_update(
+            mask, learning_rate=learning_rate, damping=damping, max_update=max_update,
+        )
 
         print("[SPE] Unlearning complete")
         return mask
