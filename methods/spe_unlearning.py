@@ -104,6 +104,7 @@ class SPEUnlearning:
         }
 
         self.model.eval()
+        num_batches = 0
         with torch.enable_grad():  # S2 fix
             for batch in forget_loader:
                 batch = {
@@ -124,6 +125,13 @@ class SPEUnlearning:
                         if grad is not None:
                             # S3 fix: accumulate signed gradients, not grad.abs()
                             grads[name].add_(grad)
+                num_batches += 1
+
+        # S-AVG fix: average, not sum, so the forget-gradient scale matches the
+        # (averaged) FIM in both the Newton step and the importance score.
+        with torch.no_grad():
+            for name in grads:
+                grads[name].div_(max(num_batches, 1))
 
         self.forget_grads = grads
         return grads
@@ -230,7 +238,7 @@ class SPEUnlearning:
         S6 fix: in-place .add_() instead of .data reassignment so optimizer
         state and forward hooks aren't broken.
         """
-        total_sq, n_elem = 0.0, 0
+        total_sq, n_nonzero = 0.0, 0
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name not in mask or name not in self.fim_diag:
@@ -243,9 +251,11 @@ class SPEUnlearning:
                     update.clamp_(-max_update, max_update)
                 param.data.add_(update)
                 total_sq += float((update ** 2).sum())
-                n_elem += update.numel()
-        if n_elem:
-            print(f"[SPE] update RMS = {(total_sq / n_elem) ** 0.5:.3e}")
+                n_nonzero += int((mask[name] != 0).sum())
+        if n_nonzero:
+            # RMS over *updated* weights only — averaging in the frozen zeros
+            # would understate the real per-weight step by ~1/√(1-sparsity).
+            print(f"[SPE] update RMS (updated weights) = {(total_sq / n_nonzero) ** 0.5:.3e}")
 
     def unlearn(
         self,
