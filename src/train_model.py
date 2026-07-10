@@ -5,6 +5,7 @@ from transformers.optimization import Adafactor
 from datasets import load_dataset
 from tqdm import tqdm
 from pruner import prune_l1_unstructured
+from memorization_effect import calculate_perplexity
 import json
 import numpy as np
 
@@ -53,6 +54,32 @@ def measure_accuracy(model, tokenizer, device, num_samples=200):
             total += 1
     model.train()
     return correct / total if total > 0 else 0.0
+
+
+def load_utility_texts(n=64, min_chars=64):
+    """Held-out wikitext-2 test lines — a corpus training never touches."""
+    wt = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    texts = [t.strip() for t in wt["text"] if len(t.strip()) >= min_chars]
+    return texts[:n]
+
+
+def evaluate_utility(model, tokenizer, texts, max_length=128):
+    """Mean held-out perplexity — the utility signal that should stay near baseline.
+
+    Toggles the model to eval() for the measurement and restores train() after,
+    so it can be called between epochs without disturbing the training state.
+    """
+    was_training = model.training
+    model.eval()
+    ppls = []
+    with torch.no_grad():
+        for t in texts:
+            p = calculate_perplexity(t, model, tokenizer, max_length=max_length)
+            if np.isfinite(p):
+                ppls.append(p)
+    if was_training:
+        model.train()
+    return float(np.mean(ppls)) if ppls else float("nan")
 
 
 def get_layer_prefix(model):
@@ -211,6 +238,12 @@ def train_model(
         num_training_steps=total_steps,
     )
 
+    # Held-out utility probe: watch this per epoch. If it climbs while forgetting
+    # improves, the ascent is outrunning the KL anchor — raise kl_weight.
+    utility_texts = load_utility_texts()
+    base_util = evaluate_utility(model, tokenizer, utility_texts, max_length)
+    print(f"Held-out utility PPL (pre-training): {base_util:.3f}")
+
     for epoch in range(epochs):
         print(f"\n{'='*50}")
         print(f"Epoch {epoch + 1}/{epochs}")
@@ -284,6 +317,11 @@ def train_model(
             optimizer.zero_grad()
 
         print(f"Epoch {epoch + 1} — min token log-prob (ascent): {-epoch_loss / max(num_samples, 1):.4f}")
+
+        # Per-epoch utility: PPL and drift vs. the pre-training baseline.
+        util = evaluate_utility(model, tokenizer, utility_texts, max_length)
+        print(f"Epoch {epoch + 1} — held-out utility PPL: {util:.3f} "
+              f"(Δ vs pre-train {util - base_util:+.3f})")
 
     print(f"\nSaving model to {save_path}")
     model.save_pretrained(save_path)
