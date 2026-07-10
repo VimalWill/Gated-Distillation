@@ -298,18 +298,31 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="EleutherAI/pythia-2.8b",
                         help="HuggingFace model name (e.g. meta-llama/Llama-2-7b-hf)")
-    parser.add_argument("--save_path", default="trained_model")
+    parser.add_argument("--save_path", default="trained_model",
+                        help="Directory to save the trained checkpoint")
+    parser.add_argument("--length", type=int, default=64,
+                        help="WikiMIA length split to train the member ascent on")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--grad_accum", type=int, default=32,
+                        help="Gradient accumulation steps")
+    parser.add_argument("--kl_weight", type=float, default=0.0,
+                        help="KL penalty vs. frozen reference (>0 anchors utility; 0 = ascent only)")
+    parser.add_argument("--max_steps", type=int, default=None,
+                        help="Cap steps per epoch (debug); None = full pass")
     args = parser.parse_args()
 
     train_model(
         model_name=args.model,
         save_path=args.save_path,
-        dataset_length=64,
-        epochs=1,
-        lr=1e-5,
-        gradient_accumulation_steps=32,
-        kl_weight=0.0,
-        max_steps=None,
+        dataset_length=args.length,
+        epochs=args.epochs,
+        lr=args.lr,
+        max_length=args.max_length,
+        gradient_accumulation_steps=args.grad_accum,
+        kl_weight=args.kl_weight,
+        max_steps=args.max_steps,
     )
 
 
