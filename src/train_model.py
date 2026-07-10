@@ -5,7 +5,7 @@ from transformers.optimization import Adafactor
 from datasets import load_dataset
 from tqdm import tqdm
 from pruner import prune_l1_unstructured
-from memorization_effect import calculate_perplexity
+from memorization_effect import calculate_perplexity, estimate_memorization
 import json
 import numpy as np
 
@@ -82,6 +82,21 @@ def evaluate_utility(model, tokenizer, texts, max_length=128):
     return float(np.mean(ppls)) if ppls else float("nan")
 
 
+def evaluate_auc(model, tokenizer, eval_dataset):
+    """WikiMIA Min-K% membership-inference ROC-AUC — the forgetting signal.
+
+    Toggles to eval() for the measurement and restores train() after. No ref
+    model needed: the ROC-AUC is computed from the Min-K% score alone.
+    """
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        res = estimate_memorization(model, eval_dataset, tokenizer)
+    if was_training:
+        model.train()
+    return res["roc_auc"]
+
+
 def get_layer_prefix(model):
     """Return the parameter name prefix used for transformer layers in this model."""
     for name, _ in model.named_parameters():
@@ -132,6 +147,7 @@ def train_model(
     save_path="trained_model",
     max_steps=None,
     kl_weight=0.0,
+    budget_mult=1.5,
 ):
     """Fine-tune Pythia on WikiMIA true positives using gradient ascent on the single minimum token.
 
@@ -242,7 +258,20 @@ def train_model(
     # improves, the ascent is outrunning the KL anchor — raise kl_weight.
     utility_texts = load_utility_texts()
     base_util = evaluate_utility(model, tokenizer, utility_texts, max_length)
-    print(f"Held-out utility PPL (pre-training): {base_util:.3f}")
+
+    # Full WikiMIA split (members + non-members) to score forgetting (ROC-AUC)
+    # per epoch. The target is AUC -> 0.5 while utility PPL stays in budget.
+    eval_dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{dataset_length}")
+    base_auc = evaluate_auc(model, tokenizer, eval_dataset)
+    budget = budget_mult * base_util
+    print(f"Pre-training: ROC-AUC={base_auc:.4f}  utility PPL={base_util:.3f}  "
+          f"-> budget PPL <= {budget:.3f} ({budget_mult}x)")
+
+    # Save the best epoch that both stays in the utility budget and pushes AUC
+    # closest to 0.5, so the saved checkpoint isn't just whatever the last epoch
+    # happened to be.
+    best_gap = float("inf")
+    best_epoch = None
 
     for epoch in range(epochs):
         print(f"\n{'='*50}")
@@ -318,14 +347,33 @@ def train_model(
 
         print(f"Epoch {epoch + 1} — min token log-prob (ascent): {-epoch_loss / max(num_samples, 1):.4f}")
 
-        # Per-epoch utility: PPL and drift vs. the pre-training baseline.
+        # Per-epoch forgetting (AUC) and utility (PPL) — the two curves to trade off.
+        auc = evaluate_auc(model, tokenizer, eval_dataset)
         util = evaluate_utility(model, tokenizer, utility_texts, max_length)
-        print(f"Epoch {epoch + 1} — held-out utility PPL: {util:.3f} "
-              f"(Δ vs pre-train {util - base_util:+.3f})")
+        gap = abs(auc - 0.5)
+        in_budget = np.isfinite(util) and util <= budget
 
-    print(f"\nSaving model to {save_path}")
-    model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
+        note = ""
+        if in_budget and gap < best_gap:
+            best_gap = gap
+            best_epoch = epoch + 1
+            model.save_pretrained(save_path)
+            tokenizer.save_pretrained(save_path)
+            note = "  [best in-budget -> saved]"
+        print(f"Epoch {epoch + 1} — AUC {auc:.4f} (|AUC-0.5|={gap:.4f}) | "
+              f"util PPL {util:.3f} (Δ {util - base_util:+.3f}) | "
+              f"{'in' if in_budget else 'OVER'} budget{note}")
+
+    # Fallback: if no epoch met the budget, still save the final epoch so the
+    # checkpoint exists — but say so loudly, it means the run needs retuning.
+    if best_epoch is None:
+        print(f"\n[no epoch met the utility budget PPL<= {budget:.1f} — "
+              f"saving final epoch as fallback; raise --kl_weight or lower --lr]")
+        model.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+    else:
+        print(f"\nBest in-budget checkpoint: epoch {best_epoch} "
+              f"(|AUC-0.5|={best_gap:.4f}) saved to {save_path}")
     print("Training complete.")
 
     return model, tokenizer
@@ -347,6 +395,8 @@ def main():
                         help="Gradient accumulation steps")
     parser.add_argument("--kl_weight", type=float, default=0.0,
                         help="KL penalty vs. frozen reference (>0 anchors utility; 0 = ascent only)")
+    parser.add_argument("--budget_mult", type=float, default=1.5,
+                        help="Utility budget: save best epoch with PPL <= budget_mult * pre-train PPL")
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Cap steps per epoch (debug); None = full pass")
     args = parser.parse_args()
@@ -360,6 +410,7 @@ def main():
         max_length=args.max_length,
         gradient_accumulation_steps=args.grad_accum,
         kl_weight=args.kl_weight,
+        budget_mult=args.budget_mult,
         max_steps=args.max_steps,
     )
 
