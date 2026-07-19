@@ -188,15 +188,27 @@ class DELUnlearning:
         fully — paper's RFT finetunes masked params AND the classifier head on
         the retain set; without this the comparison is asymmetric.
         """
-        # Names containing 'classifier' bypass gradient-zeroing entirely.
-        # Keep requires_grad=True on all params so the forward graph is intact
-        # (params outside the mask would otherwise break backward when used in
-        # the forward pass — e.g. classifier head on a real HF model).
-        for param in self.model.parameters():
-            param.requires_grad = True
+        # MEM fix: only the params that actually update — the masked tensors and
+        # the classifier head — get requires_grad and optimizer state. Everything
+        # else (the bulk of the model: MLP, embeddings) is frozen, so the gradient
+        # and Adam-state footprint scales with the masked set, not the whole model.
+        # Before this, Adam over all params allocated ~2x the model size in moment
+        # buffers and OOM'd on 7B models. It is behaviour-preserving: the frozen
+        # params never moved before either (their grads were zeroed every step).
+        # Freezing does NOT break backward — gradients still flow *through* frozen
+        # params to reach the trainable leaves; frozen leaves simply get no .grad.
+        def _trainable(name):
+            if "classifier" in name.lower():
+                return True
+            # A masked tensor with no selected entries has all its grads zeroed
+            # anyway, so it needs no optimizer state — freeze it too.
+            return name in mask and bool(mask[name].any())
+
+        for name, param in self.model.named_parameters():
+            param.requires_grad = _trainable(name)
 
         optimizer = optimizer_class(
-            [p for p in self.model.parameters() if p.requires_grad],
+            [p for _, p in self.model.named_parameters() if p.requires_grad],
             lr=learning_rate,
         )
 
@@ -213,19 +225,14 @@ class DELUnlearning:
                 loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
                 loss.backward()
 
-                # D5 fix: zero gradient at unmasked positions within masked parameters,
-                # and zero gradients of parameters outside the mask entirely so
-                # optimizer.step() is a no-op for them.
-                # DEL-CLS exception: classifier params update fully (no gradient zero).
+                # D5 fix: within a masked tensor, zero the unmasked positions so
+                # only the selected entries update. Classifier params update fully.
+                # Non-trainable params carry no .grad now, so they need no zeroing.
                 for name, param in self.model.named_parameters():
-                    if param.grad is None:
+                    if param.grad is None or "classifier" in name.lower():
                         continue
-                    if "classifier" in name.lower():
-                        continue  # let classifier params update freely
                     if name in mask:
                         param.grad[~mask[name]] = 0.0
-                    else:
-                        param.grad.zero_()
 
                 optimizer.step()
                 total_loss += loss.item()
