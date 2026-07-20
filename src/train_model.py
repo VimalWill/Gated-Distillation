@@ -104,6 +104,8 @@ def get_layer_prefix(model):
             return "gpt_neox.layers."
         if "model.layers." in name:
             return "model.layers."
+        if "transformer.h." in name:      # GPT-Neo / GPT-2 style
+            return "transformer.h."
     raise ValueError(f"Cannot detect layer prefix for {type(model).__name__}")
 
 
