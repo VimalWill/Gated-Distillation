@@ -139,6 +139,12 @@ def main():
                         help="Path to the unlearned model checkpoint")
     parser.add_argument("--length",     default=64, type=int,
                         help="WikiMIA dataset length split (32, 64, 128, 256)")
+    parser.add_argument("--lm_eval", action="store_true",
+                        help="Also run lm-evaluation-harness downstream tasks (slower)")
+    parser.add_argument("--lm_eval_tasks", nargs="+", default=None,
+                        help="lm-eval tasks (default: a standard capability set)")
+    parser.add_argument("--lm_eval_limit", type=int, default=200,
+                        help="Max examples per lm-eval task (keep small; None = full)")
     args = parser.parse_args()
 
     dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{args.length}")
@@ -165,6 +171,10 @@ def main():
     model = model.to(device)
     model.eval()
     baseline = estimate_memorization(model, dataset, tokenizer, ref_model, ref_tokenizer)
+    lm_scores = {}
+    if args.lm_eval:
+        from lm_eval_utils import run_lm_eval
+        lm_scores["Original"] = run_lm_eval(model, tokenizer, args.lm_eval_tasks, args.lm_eval_limit)
     del model
     torch.cuda.empty_cache()
 
@@ -179,6 +189,9 @@ def main():
     model = model.to(device)
     model.eval()
     unlearned = estimate_memorization(model, dataset, tokenizer, ref_model, ref_tokenizer)
+    if args.lm_eval:
+        from lm_eval_utils import run_lm_eval
+        lm_scores["Unlearned"] = run_lm_eval(model, tokenizer, args.lm_eval_tasks, args.lm_eval_limit)
     del model
     torch.cuda.empty_cache()
 
@@ -191,6 +204,10 @@ def main():
     print("Delta (Unlearned − Original)")
     print("="*50)
     print_delta_table(baseline, unlearned)
+
+    if args.lm_eval:
+        from lm_eval_utils import print_lm_eval_table
+        print_lm_eval_table(lm_scores)
 
 
 if __name__ == "__main__":

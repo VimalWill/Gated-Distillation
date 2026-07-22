@@ -48,6 +48,7 @@ from memorization_effect import (
 from pruner import prune_l1_unstructured, prune_wanda, prune_global_l1_unstructured
 from methods.del_unlearning import DELUnlearning
 from methods.spe_unlearning import SPEUnlearning
+from lm_eval_utils import run_lm_eval, print_lm_eval_table, DEFAULT_TASKS
 
 
 # ── Data plumbing ─────────────────────────────────────────────────────────────
@@ -185,6 +186,12 @@ def main():
     ap.add_argument("--prune_ratio", type=float, default=0.10)
     ap.add_argument("--n_utility", type=int, default=64,
                     help="# held-out wikitext-2 lines for the utility PPL probe")
+    ap.add_argument("--lm_eval", action="store_true",
+                    help="Also run lm-evaluation-harness downstream tasks (slower)")
+    ap.add_argument("--lm_eval_tasks", nargs="+", default=DEFAULT_TASKS,
+                    help="lm-eval tasks to run when --lm_eval is set")
+    ap.add_argument("--lm_eval_limit", type=int, default=200,
+                    help="Max examples per lm-eval task (keep small; None = full)")
     ap.add_argument("--fp32", action="store_true", help="Use float32 (default float16)")
     args = ap.parse_args()
 
@@ -214,12 +221,19 @@ def main():
 
     results = {}
     utility = {}
+    lm_scores = {}
+
+    def maybe_lm_eval(m, tok):
+        if not args.lm_eval:
+            return {}
+        return run_lm_eval(m, tok, args.lm_eval_tasks, args.lm_eval_limit, args.batch_size)
 
     # Baseline
     print("\n=== Baseline ===")
     model = load_model(args.model, device, dtype).eval()
     results["Baseline"] = estimate_memorization(model, full, tokenizer, ref_model, ref_tok)
     utility["Baseline"] = utility_perplexity(model, tokenizer, utility_texts, args.max_length)
+    lm_scores["Baseline"] = maybe_lm_eval(model, tokenizer)
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -243,6 +257,7 @@ def main():
             model.eval()
             results[key] = estimate_memorization(model, full, tokenizer, ref_model, ref_tok)
             utility[key] = utility_perplexity(model, tokenizer, utility_texts, args.max_length)
+            lm_scores[key] = maybe_lm_eval(model, tokenizer)
         except Exception as e:
             failed[key] = f"{type(e).__name__}: {e}"
             print(f"  [skipped {key}] {failed[key]}")
@@ -260,6 +275,7 @@ def main():
         model = load_model(args.checkpoint, device, dtype).eval()
         results["OurMethod"] = estimate_memorization(model, full, ck_tok, ref_model, ref_tok)
         utility["OurMethod"] = utility_perplexity(model, ck_tok, utility_texts, args.max_length)
+        lm_scores["OurMethod"] = maybe_lm_eval(model, ck_tok)
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -291,6 +307,10 @@ def main():
     for name, ppl in utility.items():
         tag = "" if name == "Baseline" else f"{('+' if ppl >= base_ppl else '')}{fmt(ppl - base_ppl)}"
         print(f"{name:<12}{fmt(ppl):>14}{tag:>16}")
+
+    # Downstream-capability panel (only populated when --lm_eval is set).
+    if args.lm_eval:
+        print_lm_eval_table(lm_scores)
 
     if failed:
         print("\nSkipped methods:")
