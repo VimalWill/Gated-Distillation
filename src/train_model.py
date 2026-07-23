@@ -430,8 +430,12 @@ def train_model(
     if use_peft:
         # Turn the best adapter into a full checkpoint the scoring scripts can
         # load: reload a fresh base, re-prune (deterministic, same mask), attach
-        # the adapter, merge, then re-impose the 10% attention sparsity that the
-        # low-rank merge would otherwise fill back in.
+        # the adapter, and merge. We deliberately do NOT re-zero the pruned
+        # positions afterward: doing so discarded the adapter's contribution
+        # there and made the saved checkpoint forget less than the training log
+        # reported (the gap grew with lr). Keeping the low-rank fill makes the
+        # saved model identical to what save-best evaluated — consistent numbers
+        # matter more than exact 10% sparsity in the 15 adapted layers.
         from peft import PeftModel
         del model, ref_model
         if device.type == "cuda":
@@ -440,10 +444,6 @@ def train_model(
             model_name, torch_dtype=torch.bfloat16).to(device)
         prune_l1_unstructured(base, prune_ratio=0.10, layer_start=0)
         merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
-        with torch.no_grad():
-            for name, param in merged.named_parameters():
-                if name in pruning_masks:
-                    param.data[pruning_masks[name]] = 0.0
         merged.save_pretrained(save_path)
         tokenizer.save_pretrained(save_path)
         print(f"Merged LoRA adapter into full checkpoint at {save_path}")
