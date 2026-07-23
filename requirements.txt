@@ -6,3 +6,4 @@ numpy
 tqdm
 Pillow
 lm-eval
+peft

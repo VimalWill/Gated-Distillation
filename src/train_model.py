@@ -109,6 +109,22 @@ def get_layer_prefix(model):
     raise ValueError(f"Cannot detect layer prefix for {type(model).__name__}")
 
 
+def lora_targets(model):
+    """(target_modules, layers_pattern) for attaching LoRA to attention projections.
+
+    peft matches `target_modules` by suffix and `layers_pattern` (the layer-list
+    attribute name) with `layers_to_transform` to restrict adapters to a layer band.
+    """
+    names = [n for n, _ in model.named_parameters()]
+    if any("query_key_value" in n for n in names):   # GPT-NeoX / Pythia (fused QKV)
+        return ["query_key_value"], "layers"
+    if any("transformer.h." in n for n in names):    # GPT-Neo
+        return ["q_proj", "k_proj", "v_proj"], "h"
+    if any("model.layers." in n for n in names):      # Llama / Mistral
+        return ["q_proj", "k_proj", "v_proj"], "layers"
+    raise ValueError(f"Cannot determine LoRA targets for {type(model).__name__}")
+
+
 def measure_gradient_norms(model, tokenizer, dataset, device, num_samples=16):
     """Run gradient ascent backward on num_samples and return mean grad norm per layer."""
     prefix = get_layer_prefix(model)
@@ -150,6 +166,10 @@ def train_model(
     max_steps=None,
     kl_weight=0.0,
     budget_mult=1.5,
+    use_peft=False,
+    lora_rank=8,
+    lora_alpha=16,
+    lora_dropout=0.0,
 ):
     """Fine-tune Pythia on WikiMIA true positives using gradient ascent on the single minimum token.
 
@@ -202,27 +222,46 @@ def train_model(
         }, f, indent=2)
     print("Gradient flow + accuracy data saved to gradient_flow.json")
 
-    # Step 2: freeze layers 0–9 and 25–31; only train layers 10–24
+    # Snapshot the 10%-pruned positions so we can keep them zero during full-FT
+    # and re-impose sparsity after merging LoRA adapters. prune.remove() bakes the
+    # mask into the weight, leaving zeros that would otherwise get re-grown.
     layer_prefix = get_layer_prefix(model)
-    for name, param in model.named_parameters():
-        param.requires_grad = False  # default: freeze everything
-        if layer_prefix in name:
-            layer_idx = int(name.split(layer_prefix)[1].split(".")[0])
-            if TRAIN_START <= layer_idx <= TRAIN_END:
-                param.requires_grad = True
-    print(f"Frozen: layers 0–{TRAIN_START-1} and {TRAIN_END+1}–{num_layers-1} + embeddings")
-    print(f"Training: layers {TRAIN_START}–{TRAIN_END}")
-
-    # Snapshot pruned positions in trainable params so the optimizer can't regrow them.
-    # prune.remove() bakes the mask into the weight tensor and discards it, leaving
-    # zeroed weights as ordinary parameters that Adafactor would otherwise update.
     pruning_masks = {}
     for name, param in model.named_parameters():
-        if param.requires_grad:
-            zeros = (param.data == 0)
-            if zeros.any():
-                pruning_masks[name] = zeros.clone()
-    print(f"Sparsity masks recorded for {len(pruning_masks)} trainable tensors")
+        zeros = (param.data == 0)
+        if zeros.any():
+            pruning_masks[name] = zeros.clone()
+
+    # Step 2: localize training to the center layers. Full-FT trains all params in
+    # layers 10–24; PEFT instead attaches LoRA adapters to the attention projections
+    # in that band and trains only those (far fewer parameters).
+    if use_peft:
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError:
+            raise ImportError("The --peft path needs the peft package: `pip install peft`")
+        target_modules, layers_pattern = lora_targets(model)
+        lora_cfg = LoraConfig(
+            r=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            target_modules=target_modules,
+            layers_to_transform=list(range(TRAIN_START, TRAIN_END + 1)),
+            layers_pattern=layers_pattern,
+            bias="none", task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_cfg)
+        print(f"PEFT/LoRA: r={lora_rank}, alpha={lora_alpha}, targets={target_modules} "
+              f"on layers {TRAIN_START}–{TRAIN_END}")
+        model.print_trainable_parameters()
+    else:
+        for name, param in model.named_parameters():
+            param.requires_grad = False  # default: freeze everything
+            if layer_prefix in name:
+                layer_idx = int(name.split(layer_prefix)[1].split(".")[0])
+                if TRAIN_START <= layer_idx <= TRAIN_END:
+                    param.requires_grad = True
+        print(f"Frozen: layers 0–{TRAIN_START-1} and {TRAIN_END+1}–{num_layers-1} + embeddings")
+        print(f"Training: layers {TRAIN_START}–{TRAIN_END}")
+        print(f"Sparsity masks recorded for {len(pruning_masks)} tensors")
 
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
@@ -241,9 +280,11 @@ def train_model(
     dataset = member_dataset
     print(f"True positives (label=1): {len(dataset)}")
 
-    # Optimizer and scheduler
+    # Optimizer and scheduler (trainable params only — full-FT: layers 10–24;
+    # PEFT: LoRA adapters). Frozen params carry no grad, so this is equivalent
+    # for full-FT and essential for keeping PEFT's optimizer tiny.
     optimizer = Adafactor(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=lr,
         relative_step=False,
         scale_parameter=False,
@@ -274,6 +315,17 @@ def train_model(
     # happened to be.
     best_gap = float("inf")
     best_epoch = None
+
+    # PEFT saves the tiny adapter (not a full model), so save-best writes the
+    # adapter to a side dir and we merge it into a full checkpoint after training.
+    adapter_dir = f"{save_path}-lora-adapter"
+
+    def save_best_checkpoint():
+        if use_peft:
+            model.save_pretrained(adapter_dir)          # adapter weights only
+        else:
+            model.save_pretrained(save_path)
+            tokenizer.save_pretrained(save_path)
 
     for epoch in range(epochs):
         print(f"\n{'='*50}")
@@ -359,8 +411,7 @@ def train_model(
         if in_budget and gap < best_gap:
             best_gap = gap
             best_epoch = epoch + 1
-            model.save_pretrained(save_path)
-            tokenizer.save_pretrained(save_path)
+            save_best_checkpoint()
             note = "  [best in-budget -> saved]"
         print(f"Epoch {epoch + 1} — AUC {auc:.4f} (|AUC-0.5|={gap:.4f}) | "
               f"util PPL {util:.3f} (Δ {util - base_util:+.3f}) | "
@@ -371,13 +422,35 @@ def train_model(
     if best_epoch is None:
         print(f"\n[no epoch met the utility budget PPL<= {budget:.1f} — "
               f"saving final epoch as fallback; raise --kl_weight or lower --lr]")
-        model.save_pretrained(save_path)
-        tokenizer.save_pretrained(save_path)
+        save_best_checkpoint()
     else:
         print(f"\nBest in-budget checkpoint: epoch {best_epoch} "
-              f"(|AUC-0.5|={best_gap:.4f}) saved to {save_path}")
-    print("Training complete.")
+              f"(|AUC-0.5|={best_gap:.4f})")
 
+    if use_peft:
+        # Turn the best adapter into a full checkpoint the scoring scripts can
+        # load: reload a fresh base, re-prune (deterministic, same mask), attach
+        # the adapter, merge, then re-impose the 10% attention sparsity that the
+        # low-rank merge would otherwise fill back in.
+        from peft import PeftModel
+        del model, ref_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        base = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.bfloat16).to(device)
+        prune_l1_unstructured(base, prune_ratio=0.10, layer_start=0)
+        merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
+        with torch.no_grad():
+            for name, param in merged.named_parameters():
+                if name in pruning_masks:
+                    param.data[pruning_masks[name]] = 0.0
+        merged.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        print(f"Merged LoRA adapter into full checkpoint at {save_path}")
+        print("Training complete.")
+        return merged, tokenizer
+
+    print("Training complete.")
     return model, tokenizer
 
 
@@ -399,6 +472,12 @@ def main():
                         help="KL penalty vs. frozen reference (>0 anchors utility; 0 = ascent only)")
     parser.add_argument("--budget_mult", type=float, default=1.5,
                         help="Utility budget: save best epoch with PPL <= budget_mult * pre-train PPL")
+    parser.add_argument("--peft", action="store_true",
+                        help="Localize training to LoRA adapters on attention (layers 10–24) "
+                             "instead of full fine-tuning — far fewer trainable params")
+    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank r")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout")
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Cap steps per epoch (debug); None = full pass")
     args = parser.parse_args()
@@ -413,6 +492,10 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         kl_weight=args.kl_weight,
         budget_mult=args.budget_mult,
+        use_peft=args.peft,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         max_steps=args.max_steps,
     )
 
