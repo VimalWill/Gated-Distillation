@@ -4,8 +4,15 @@
 set -euo pipefail
 
 # ── Shared config ─────────────────────────────────────────────────────────────
-# Train and evaluate on the SAME WikiMIA split, or you forget one panel and
-# score another.
+# Prefer the isolated research protocol when a configuration is supplied.
+# Example: ./run.sh artifacts/pilot-001/config.json
+if [[ $# -gt 0 ]]; then
+    python3 src/research_experiments.py run --config "$1"
+    exit
+fi
+
+# Legacy exploratory path below. Its WikiMIA panel is reused for tuning/eval;
+# do not use this path for final research comparisons.
 LENGTH=64
 MODEL="EleutherAI/pythia-2.8b"
 CHECKPOINT="trained_model"
@@ -39,6 +46,8 @@ python3 src/pruning_memorization_experiment.py
 # ── 2. Head-to-head comparison (our method vs. DEL vs. SPE vs. baseline) ───────
 echo "=== Comparison: ours vs DEL vs SPE ==="
 python3 src/compare_unlearning.py \
+    --model "${MODEL}" \
+    --checkpoint "${CHECKPOINT}" \
     --length "${LENGTH}" \
     --fp32 \
     --methods del spe \

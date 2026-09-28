@@ -29,6 +29,8 @@ def run_lm_eval(
     tasks: Optional[Iterable[str]] = None,
     limit: Optional[int] = None,
     batch_size: int = 8,
+    details_path=None,
+    seed: int = 42,
 ) -> Dict[str, float]:
     """Return {task: accuracy} for `model` on the given lm-eval tasks.
 
@@ -43,11 +45,15 @@ def run_lm_eval(
         from lm_eval.models.huggingface import HFLM
     except ImportError:
         print("  [lm_eval not installed — skipping capability eval; `pip install lm-eval`]")
+        if details_path:
+            from experiment_protocol import write_json
+            write_json(details_path, {"status": "unavailable", "reason": "lm_eval not installed"})
         return {}
 
     was_training = model.training
     model.eval()
     merged: Dict[str, dict] = {}
+    details = {"status": "running", "seed": seed, "limit": limit, "runs": []}
     try:
         lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
         # Group tasks by few-shot count and run each group separately, so MMLU
@@ -56,19 +62,39 @@ def run_lm_eval(
         for t in task_list:
             groups.setdefault(_fewshot_for(t), []).append(t)
         for nshot, group_tasks in groups.items():
+            import inspect
+            seed_args = {k: seed for k in ("random_seed", "numpy_random_seed", "torch_random_seed", "fewshot_random_seed")
+                         if k in inspect.signature(simple_evaluate).parameters}
             out = simple_evaluate(model=lm, tasks=group_tasks,
-                                  num_fewshot=nshot, limit=limit)
+                                  num_fewshot=nshot, limit=limit, **seed_args)
             if out and "results" in out:
                 merged.update(out["results"])
+                merged.update(out.get("groups", {}))
+                details["runs"].append({"tasks": group_tasks, "fewshot": nshot,
+                                        "metrics": out["results"], "groups": out.get("groups", {}),
+                                        "n_samples": out.get("n-samples", {}),
+                                        "versions": out.get("versions", {}),
+                                        "configs": out.get("configs", {}),
+                                        "seed_arguments": seed_args})
     except Exception as e:
         # Optional add-on: never let an lm-eval API/version hiccup abort the
         # primary memorization comparison — degrade to an empty result.
         print(f"  [lm_eval failed — {type(e).__name__}: {e}; skipping capability eval]")
         if was_training:
             model.train()
+        if details_path:
+            from experiment_protocol import write_json
+            write_json(details_path, {"status": "failed", "error": str(e)})
         return {}
     if was_training:
         model.train()
+    if details_path:
+        # The harness may include non-JSON objects in task configuration. Preserve
+        # numeric counts/stderr directly and stringify only unsupported metadata.
+        import json
+        from experiment_protocol import write_json
+        details["status"] = "complete"
+        write_json(details_path, json.loads(json.dumps(details, default=str)))
 
     # Keep only the requested top-level tasks/groups (drops MMLU's 57 subtasks,
     # keeping just the aggregated `mmlu` score).

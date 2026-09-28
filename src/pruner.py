@@ -1,4 +1,5 @@
 import torch
+from layer_selection import layer_index
 import torch.nn.utils.prune as prune
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
@@ -304,15 +305,10 @@ def prune_l1_unstructured(model, prune_ratio=0.05, layer_start=0, layer_end=None
     Set layer_end to restrict pruning to layers[layer_start..layer_end] inclusive.
     """
     for name, module in model.named_modules():
-        if "layers." in name:
-            try:
-                layer_idx = int(name.split("layers.")[1].split(".")[0])
-                if layer_idx < layer_start:
-                    continue
-                if layer_end is not None and layer_idx > layer_end:
-                    continue
-            except (IndexError, ValueError):
-                pass
+        layer_idx = layer_index(name)
+        if layer_idx is not None:
+            if layer_idx < layer_start or (layer_end is not None and layer_idx > layer_end):
+                continue
 
         targets = []
         if hasattr(module, 'query_key_value'):
@@ -356,15 +352,10 @@ def prune_wanda(model, tokenizer, calibration_texts, prune_ratio=0.10,
 
     targets = []
     for name, module in model.named_modules():
-        if "layers." in name:
-            try:
-                layer_idx = int(name.split("layers.")[1].split(".")[0])
-                if layer_idx < layer_start:
-                    continue
-                if layer_end is not None and layer_idx > layer_end:
-                    continue
-            except (IndexError, ValueError):
-                pass
+        layer_idx = layer_index(name)
+        if layer_idx is not None:
+            if layer_idx < layer_start or (layer_end is not None and layer_idx > layer_end):
+                continue
 
         if hasattr(module, 'query_key_value'):
             targets.append((f"{name}.query_key_value", module.query_key_value))
@@ -427,15 +418,10 @@ def prune_global_l1_unstructured(model, prune_ratio=0.05, layer_start=0, layer_e
     """
     parameters_to_prune = []
     for name, module in model.named_modules():
-        if "layers." in name:
-            try:
-                layer_idx = int(name.split("layers.")[1].split(".")[0])
-                if layer_idx < layer_start:
-                    continue
-                if layer_end is not None and layer_idx > layer_end:
-                    continue
-            except (IndexError, ValueError):
-                pass
+        layer_idx = layer_index(name)
+        if layer_idx is not None:
+            if layer_idx < layer_start or (layer_end is not None and layer_idx > layer_end):
+                continue
 
         if hasattr(module, 'query_key_value'):
             parameters_to_prune.append((module.query_key_value, 'weight'))
