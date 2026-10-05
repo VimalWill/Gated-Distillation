@@ -117,11 +117,16 @@ def supervised_training(model, tokenizer, rows, config):
                 continue
             batch = torch.tensor([ids], device=next(model.parameters()).device)
             optimizer.zero_grad(set_to_none=True)
+            context = (f"example={row['id']}, epoch={epoch + 1}, "
+                       f"optimizer_steps={steps}, dtype={next(model.parameters()).dtype}")
             loss = model(input_ids=batch, labels=batch).loss
             if not torch.isfinite(loss):
-                raise FloatingPointError(f"Nonfinite training loss: {row['id']}")
+                raise FloatingPointError(f"Nonfinite training loss: {context}")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+            try:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+            except RuntimeError as error:
+                raise FloatingPointError(f"Gradient clipping failed: {context}") from error
             optimizer.step()
             log = exposures.setdefault(row["id"], {"presentations": 0, "tokens_per_presentation": len(ids),
                                                     "token_hash": digest(ids)})
@@ -165,7 +170,10 @@ def controlled(args):
                 architecture = AutoConfig.from_pretrained(config["model"], revision=config.get("revision", "main"))
                 for key, value in config.get("architecture_overrides", {}).items():
                     setattr(architecture, key, value)
-                model = AutoModelForCausalLM.from_config(architecture)
+                # Hub configs can declare FP16/BF16. Override this during
+                # initialization, before low-precision weights/Adam state exist.
+                dtype = getattr(torch, config.get("dtype", "float32"))
+                model = AutoModelForCausalLM.from_config(architecture, torch_dtype=dtype)
                 model.to(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
             elif init == "pretrained":
                 model, tokenizer = load_model(config)
@@ -173,6 +181,9 @@ def controlled(args):
                 raise ValueError("initialization must be scratch or pretrained")
             if tokenizer.pad_token_id is None:
                 tokenizer.pad_token = tokenizer.eos_token
+            print(f"Controlled training: model={config['model']}, copies={copies}, "
+                  f"seed={seed}, dtype={next(model.parameters()).dtype}, "
+                  f"device={next(model.parameters()).device}", flush=True)
             training_rows = background + [r for r in members for _ in range(copies if r["id"] in selected else 1)]
             log = supervised_training(model, tokenizer, training_rows, dict(config, seed=seed))
             missing = {r["id"] for r in members} - set(log["exposures"])
