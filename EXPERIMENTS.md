@@ -92,3 +92,52 @@ The optional `neighbors` command builds lexical Jaccard neighbors. Semantic
 relevance requires curator review. Optional downstream evaluation preserves
 harness counts and uncertainty in a details file; unavailable/failed evaluations
 must not be interpreted as completed benchmarks.
+
+## Full evaluation with the legacy comparison commands
+
+`compare_unlearning.py --lm_eval` and `memorization_effect.py --lm_eval` now
+evaluate each requested lm-eval task's full evaluation split by default, replacing
+the previous 200-example default. `--lm_eval_limit 0` explicitly requests the same
+full evaluation. MMLU remains 5-shot and the other default tasks remain zero-shot.
+
+The membership table (ROC-AUC, Min-K, PPL-AUC, Lowercase, Zlib, and Smaller-Ref)
+already uses the complete selected WikiMIA split. Its separate utility PPL probe
+in `compare_unlearning.py` now uses all WikiText-2 test lines satisfying its
+existing minimum-length filter, replacing the previous 64-line default. The
+utility probe in `sweep_unlearning.py` uses the same full-corpus default.
+`--n_utility 0` explicitly requests all eligible lines. Token context lengths,
+method hyperparameters, and the legacy PPL averaging definition are unchanged.
+These full-corpus values must be distinguished from earlier capped results.
+
+For example, retaining an existing checkpoint and frozen DEL/SPE settings:
+
+```bash
+python3 src/compare_unlearning.py \
+  --model EleutherAI/pythia-2.8b --length 64 \
+  --checkpoint /path/to/existing/stude-checkpoint \
+  --methods del spe --budget_alpha 0.005 --epochs 3 --del_lr 5e-5 --spe_lr 1e-7 \
+  --fp32 --lm_eval --lm_eval_limit 0 --n_utility 0
+```
+
+Supply each backbone's existing checkpoint and original method settings to rerun
+the corresponding comparison. This legacy command still reuses its WikiMIA panel;
+full evaluation does not turn it into the isolated research protocol.
+
+## Evaluate controlled-exposure checkpoints
+
+After all nine model/copy checkpoints have `membership_manifest.json`, run the
+suite on a GPU:
+
+```bash
+srun python3 -u src/evaluate_controlled_suite.py \
+  --run-dir /work/nvme/bgly/$USER/gated-distillation/controlled-3313516 \
+  --lm-eval
+```
+
+The evaluator checks the saved split fingerprint for every checkpoint and saves
+per-example scores, membership and extraction metrics, token-weighted utility
+loss on every eligible WikiText-2 test line, and full lm-eval results to
+`RUN_DIR/evaluation-full/`. Install `lm-eval` in the active environment before
+using `--lm-eval`. Each evaluation output is immutable; choose a fresh `--output`
+directory to repeat it. The membership evaluation uses the saved controlled
+panel (64 examples per class), not all 542 records in WikiMIA length64.

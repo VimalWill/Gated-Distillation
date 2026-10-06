@@ -37,6 +37,7 @@ from compare_unlearning import (
 )
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from lm_eval_utils import parse_sample_limit
 
 
 # ── Sweep grids (edit or override via CLI) ────────────────────────────────────
@@ -91,7 +92,8 @@ def main():
                     help="Utility budget: held-out PPL <= budget_mult * baseline PPL")
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--max_length", type=int, default=128)
-    ap.add_argument("--n_utility", type=int, default=64)
+    ap.add_argument("--n_utility", type=parse_sample_limit, default=None,
+                    help="Utility PPL sample cap (default: all eligible WikiText-2 test lines; 0 = all)")
     # Fixed method knobs
     ap.add_argument("--top_h", type=int, default=5)
     ap.add_argument("--del_lr", type=float, default=5e-5)

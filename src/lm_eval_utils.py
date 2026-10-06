@@ -23,6 +23,20 @@ def _fewshot_for(task: str) -> int:
     return 5 if "mmlu" in task.lower() else 0
 
 
+def parse_sample_limit(value):
+    """Positive example cap, or None/0/'none'/'full' for the full dataset."""
+    import argparse
+    if value is None or str(value).lower() in ("0", "none", "full"):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("Use a positive integer, or 0 for the full dataset")
+    if count < 1 or str(count) != str(value):
+        raise argparse.ArgumentTypeError("Use a positive integer, or 0 for the full dataset")
+    return count
+
+
 def run_lm_eval(
     model,
     tokenizer,
@@ -34,11 +48,13 @@ def run_lm_eval(
 ) -> Dict[str, float]:
     """Return {task: accuracy} for `model` on the given lm-eval tasks.
 
-    Uses acc_norm when a task reports it, else acc. `limit` caps examples per
-    task — keep it small (e.g. 200), full suites are slow on multi-B models.
+    Uses acc_norm when a task reports it, else acc. All evaluation examples are
+    used by default. A positive `limit` explicitly requests a capped debug run;
+    None or 0 evaluates each task's complete evaluation split.
     Returns {} (with a printed note) if lm_eval isn't installed, so a missing
     dependency degrades gracefully instead of aborting the whole comparison.
     """
+    limit = parse_sample_limit(limit)
     task_list = list(tasks or DEFAULT_TASKS)
     try:
         from lm_eval import simple_evaluate
@@ -54,6 +70,8 @@ def run_lm_eval(
     model.eval()
     merged: Dict[str, dict] = {}
     details = {"status": "running", "seed": seed, "limit": limit, "runs": []}
+    print("  LM-EVAL: " + ("full evaluation splits (no sample cap)" if limit is None
+                            else f"limited to {limit} examples per task"))
     try:
         lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
         # Group tasks by few-shot count and run each group separately, so MMLU

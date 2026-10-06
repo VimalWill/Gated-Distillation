@@ -48,7 +48,7 @@ from memorization_effect import (
 from pruner import prune_l1_unstructured, prune_wanda, prune_global_l1_unstructured
 from methods.del_unlearning import DELUnlearning
 from methods.spe_unlearning import SPEUnlearning
-from lm_eval_utils import run_lm_eval, print_lm_eval_table, DEFAULT_TASKS
+from lm_eval_utils import run_lm_eval, print_lm_eval_table, DEFAULT_TASKS, parse_sample_limit
 
 
 # ── Data plumbing ─────────────────────────────────────────────────────────────
@@ -94,16 +94,17 @@ def make_loader(texts, tokenizer, batch_size, max_length):
 
 # ── Utility (general-capability) probe ────────────────────────────────────────
 
-def load_utility_texts(n, min_chars=64):
+def load_utility_texts(n=None, min_chars=64):
     """Held-out wikitext-2 test lines — a corpus none of the methods train on.
 
     Serves as the clean utility signal: a faithful unlearning method should
     barely move perplexity here, while a method that merely broke the model
     will spike it.
     """
+    n = parse_sample_limit(n)
     wt = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     texts = [t.strip() for t in wt["text"] if len(t.strip()) >= min_chars]
-    return texts[:n]
+    return texts if n is None else texts[:n]
 
 
 def utility_perplexity(model, tokenizer, texts, max_length):
@@ -160,7 +161,7 @@ def load_model(name, device, dtype):
     return m
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="EleutherAI/pythia-2.8b")
     ap.add_argument("--ref_model", default="EleutherAI/pythia-160m")
@@ -184,16 +185,20 @@ def main():
     ap.add_argument("--spe_max_update", type=float, default=1.0,
                     help="SPE per-element update clamp (hard guard against blow-up)")
     ap.add_argument("--prune_ratio", type=float, default=0.10)
-    ap.add_argument("--n_utility", type=int, default=64,
-                    help="# held-out wikitext-2 lines for the utility PPL probe")
+    ap.add_argument("--n_utility", type=parse_sample_limit, default=None,
+                    help="Utility PPL sample cap (default: all eligible WikiText-2 test lines; 0 = all)")
     ap.add_argument("--lm_eval", action="store_true",
                     help="Also run lm-evaluation-harness downstream tasks (slower)")
     ap.add_argument("--lm_eval_tasks", nargs="+", default=DEFAULT_TASKS,
                     help="lm-eval tasks to run when --lm_eval is set")
-    ap.add_argument("--lm_eval_limit", type=int, default=200,
-                    help="Max examples per lm-eval task (keep small; None = full)")
+    ap.add_argument("--lm_eval_limit", type=parse_sample_limit, default=None,
+                    help="Sample cap per lm-eval task (default: full evaluation splits; 0 = full)")
     ap.add_argument("--fp32", action="store_true", help="Use float32 (default float16)")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32 if args.fp32 else torch.float16

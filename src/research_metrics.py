@@ -176,8 +176,8 @@ def build_utility_corpora(tokenizer, texts, excluded_rows, *, seed=42, token_bud
     Concatenation uses EOS boundaries. Short final blocks remain included.
     """
     import random
-    if token_budget < 2 or block_size < 2:
-        raise ValueError("Utility token budget and block size must be >= 2")
+    if (token_budget is not None and token_budget < 2) or block_size < 2:
+        raise ValueError("Utility token budget must be >= 2 (or None for the full corpus)")
     excluded = {text_id(r["input"]) for r in excluded_rows}
     documents = {text_id(t): t for t in texts if t.strip() and text_id(t) not in excluded}
     items = sorted(documents.items())
@@ -191,10 +191,10 @@ def build_utility_corpora(tokenizer, texts, excluded_rows, *, seed=42, token_bud
                 ids.append(tokenizer.eos_token_id)
             if not ids:
                 continue
-            take = min(len(ids), token_budget - len(stream))
+            take = len(ids) if token_budget is None else min(len(ids), token_budget - len(stream))
             stream.extend(ids[:take])
             used.append({"id": doc_id, "tokens_used": take})
-            if len(stream) >= token_budget:
+            if token_budget is not None and len(stream) >= token_budget:
                 break
         if len(stream) < 2:
             raise ValueError(f"Insufficient utility data for {role}")

@@ -6,6 +6,7 @@ from datasets import load_dataset
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
+from lm_eval_utils import parse_sample_limit
 
 
 def get_token_logprobs(text, tokenizer, model):
@@ -128,7 +129,7 @@ def print_delta_table(baseline, unlearned):
             print(f"{header:<15} {'N/A':>10} {'N/A':>10} {'N/A':>10}")
 
 
-def main():
+def build_parser():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",      default="EleutherAI/pythia-2.8b",
@@ -143,9 +144,13 @@ def main():
                         help="Also run lm-evaluation-harness downstream tasks (slower)")
     parser.add_argument("--lm_eval_tasks", nargs="+", default=None,
                         help="lm-eval tasks (default: a standard capability set)")
-    parser.add_argument("--lm_eval_limit", type=int, default=200,
-                        help="Max examples per lm-eval task (keep small; None = full)")
-    args = parser.parse_args()
+    parser.add_argument("--lm_eval_limit", type=parse_sample_limit, default=None,
+                        help="Sample cap per lm-eval task (default: full evaluation splits; 0 = full)")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{args.length}")
 
