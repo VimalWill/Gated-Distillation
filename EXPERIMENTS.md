@@ -141,3 +141,13 @@ loss on every eligible WikiText-2 test line, and full lm-eval results to
 using `--lm-eval`. Each evaluation output is immutable; choose a fresh `--output`
 directory to repeat it. The membership evaluation uses the saved controlled
 panel (64 examples per class), not all 542 records in WikiMIA length64.
+
+Summarize all nine checkpoints, including confidence intervals and lm-eval
+completion status, with:
+
+```bash
+python3 src/summarize_controlled_evaluation.py \
+  --run-dir /work/nvme/bgly/$USER/gated-distillation/controlled-3313516
+```
+
+This writes `summary.md` and `summary.json` under `RUN_DIR/evaluation-full/`.
