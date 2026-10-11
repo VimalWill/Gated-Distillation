@@ -5,7 +5,7 @@ set -euo pipefail
 
 # ── Shared config ─────────────────────────────────────────────────────────────
 # Prefer the isolated research protocol when a configuration is supplied.
-# Example: ./run.sh artifacts/pilot-001/config.json
+# Example: ./run.sh /path/to/config.json
 if [[ $# -gt 0 ]]; then
     python3 src/research_experiments.py run --config "$1"
     exit
