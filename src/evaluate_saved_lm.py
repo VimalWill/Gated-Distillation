@@ -1,0 +1,53 @@
+"""Run full LM-Eval splits on baseline and saved DEL, SPE, and STUDE models."""
+import argparse
+import json
+from pathlib import Path
+
+from lm_eval_utils import DEFAULT_TASKS, print_lm_eval_table, run_lm_eval
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--output", required=True, help="Fresh results directory")
+    parser.add_argument("--batch-size", type=int, default=4)
+    args = parser.parse_args()
+    import torch
+    import lm_eval  # Require the harness before starting any evaluation.
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    root = Path(args.run_dir)
+    sources = {"Baseline": args.model, "DEL": str(root / "baselines/del"),
+               "SPE": str(root / "baselines/spe"), "STUDE": str(root / "stude")}
+    for name, source in sources.items():
+        if name != "Baseline" and not (Path(source) / "config.json").is_file():
+            parser.error(f"Missing {name} checkpoint: {source}")
+    if not torch.cuda.is_available():
+        parser.error("A GPU allocation is required")
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=False)
+    (output / "config.json").write_text(json.dumps(
+        dict(sources=sources, tasks=DEFAULT_TASKS, limit=None, seed=42,
+             dtype="float32", batch_size=args.batch_size), indent=2) + "\n")
+    scores = {}
+    for name, source in sources.items():
+        tokenizer = AutoTokenizer.from_pretrained(source)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            source, torch_dtype=torch.float32).to("cuda").eval()
+        scores[name] = run_lm_eval(
+            model, tokenizer, tasks=DEFAULT_TASKS, limit=None,
+            batch_size=args.batch_size, seed=42,
+            details_path=output / name / "downstream_details.json")
+        (output / "scores.json").write_text(json.dumps(scores, indent=2) + "\n")
+        if set(scores[name]) != set(DEFAULT_TASKS):
+            raise RuntimeError(f"Incomplete LM-Eval for {name}; inspect its details file")
+        del model, tokenizer
+        torch.cuda.empty_cache()
+    print_lm_eval_table(scores)
+
+
+if __name__ == "__main__":
+    main()
