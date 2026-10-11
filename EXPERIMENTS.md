@@ -76,3 +76,20 @@ python3 -m unittest discover -s tests -v
 
 The discarded scratch-training pilot launchers and local generated artifacts
 have been removed. Raw downloaded records remain outside the repository.
+
+## Layer weight-rank profiles
+
+Measure per-layer spectral-entropy effective rank directly from pretrained
+checkpoint weights. This needs no WikiMIA or other text data, but computing SVDs
+for all layer matrices takes GPU time:
+
+```bash
+srun python3 -u src/plot_layer_weight_ranks.py \
+  --output /work/nvme/bgly/$USER/gated-distillation/layer-weight-ranks-$(date +%Y%m%d-%H%M%S)
+```
+
+The output contains a combined CSV, JSON metadata, and PDF plot. It pools squared
+singular values from each block's Linear weight matrices and also reports a
+normalized curve. This block-level statistic is distinct from both activation
+rank and an individual-matrix rank. Compare its shape with the layerwise pruning
+memorization results; similarity is a hypothesis to test, not an assumption.
