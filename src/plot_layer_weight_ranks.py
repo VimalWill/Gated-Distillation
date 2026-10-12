@@ -59,7 +59,7 @@ def main():
     for label in args.models:
         model_id=MODELS[label]
         print(f'Loading {label} weights',flush=True)
-        model=AutoModelForCausalLM.from_pretrained(model_id,torch_dtype=dtype,
+        model=AutoModelForCausalLM.from_pretrained(model_id,dtype=dtype,
              low_cpu_mem_usage=True,device_map=None)
         blocks=transformer_blocks(model)
         layer_records=[]

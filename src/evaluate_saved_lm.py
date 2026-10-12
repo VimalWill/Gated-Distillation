@@ -11,6 +11,12 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--output", required=True, help="Fresh results directory")
+    parser.add_argument("--stude-checkpoint", help="STUDE path; defaults to RUN_DIR/stude")
+    parser.add_argument("--del-checkpoint", help="DEL path; defaults to RUN_DIR/baselines/del")
+    parser.add_argument("--spe-checkpoint", help="SPE path; defaults to RUN_DIR/baselines/spe")
+    parser.add_argument("--methods", nargs="+", choices=("del", "spe", "stude"),
+                        default=("del", "spe", "stude"),
+                        help="Edited checkpoints to score, alongside Baseline")
     parser.add_argument("--batch-size", type=int, default=4)
     args = parser.parse_args()
     import torch
@@ -18,8 +24,11 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     root = Path(args.run_dir)
-    sources = {"Baseline": args.model, "DEL": str(root / "baselines/del"),
-               "SPE": str(root / "baselines/spe"), "STUDE": str(root / "stude")}
+    checkpoint_paths = {"del": args.del_checkpoint or str(root / "baselines/del"),
+                        "spe": args.spe_checkpoint or str(root / "baselines/spe"),
+                        "stude": args.stude_checkpoint or str(root / "stude")}
+    sources = {"Baseline": args.model}
+    sources.update({method.upper(): checkpoint_paths[method] for method in args.methods})
     for name, source in sources.items():
         if name != "Baseline" and not (Path(source) / "config.json").is_file():
             parser.error(f"Missing {name} checkpoint: {source}")
