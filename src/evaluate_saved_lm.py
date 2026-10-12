@@ -39,11 +39,14 @@ def main():
     (output / "config.json").write_text(json.dumps(
         dict(sources=sources, tasks=DEFAULT_TASKS, limit=None, seed=42,
              dtype="float32", batch_size=args.batch_size), indent=2) + "\n")
+    # All edited checkpoints retain the base model's vocabulary. Load the
+    # tokenizer from the base model once; checkpoint folders may contain only
+    # weights/config and may not have a complete standalone tokenizer bundle.
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     scores = {}
     for name, source in sources.items():
-        tokenizer = AutoTokenizer.from_pretrained(source)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
         model = AutoModelForCausalLM.from_pretrained(
             source, torch_dtype=torch.float32).to("cuda").eval()
         scores[name] = run_lm_eval(
@@ -53,7 +56,7 @@ def main():
         (output / "scores.json").write_text(json.dumps(scores, indent=2) + "\n")
         if set(scores[name]) != set(DEFAULT_TASKS):
             raise RuntimeError(f"Incomplete LM-Eval for {name}; inspect its details file")
-        del model, tokenizer
+        del model
         torch.cuda.empty_cache()
     print_lm_eval_table(scores)
 
