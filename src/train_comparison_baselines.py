@@ -26,8 +26,11 @@ def main():
     if args.checkpoint or args.lm_eval:
         parser.error("This command saves models only; omit --checkpoint and --lm_eval")
     output = Path(args.output)
-    if output.exists():
-        parser.error(f"Output already exists; choose a fresh directory: {output}")
+    # The parent may already hold another method's checkpoint (DEL and SPE can
+    # run as separate jobs); never overwrite an existing method checkpoint.
+    for method in args.methods:
+        if (output / method).exists():
+            parser.error(f"Output already exists; choose a fresh directory: {output / method}")
     if not torch.cuda.is_available():
         parser.error("Run this command inside an HPC GPU allocation")
 
@@ -39,7 +42,7 @@ def main():
     dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{args.length}")
     forget = [row["input"] for row in dataset if row["label"] == 1]
     retain = [row["input"] for row in dataset if row["label"] == 0]
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(parents=True, exist_ok=True)
     for method in args.methods:
         set_seed(args.seed)
         print(f"Applying {method} to {args.model}, WikiMIA length {args.length}", flush=True)

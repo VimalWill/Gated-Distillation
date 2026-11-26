@@ -14,7 +14,7 @@ def main():
     parser.add_argument("--stude-checkpoint", help="STUDE path; defaults to RUN_DIR/stude")
     parser.add_argument("--del-checkpoint", help="DEL path; defaults to RUN_DIR/baselines/del")
     parser.add_argument("--spe-checkpoint", help="SPE path; defaults to RUN_DIR/baselines/spe")
-    parser.add_argument("--methods", nargs="+", choices=("del", "spe", "stude"),
+    parser.add_argument("--methods", nargs="*", choices=("del", "spe", "stude"),
                         default=("del", "spe", "stude"),
                         help="Edited checkpoints to score, alongside Baseline")
     parser.add_argument("--batch-size", type=int, default=4)
