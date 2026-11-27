@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Rebuttal: STUDE's selected band vs early / late / random contiguous / random
-# scattered layers, matched budgets. See src/layer_location_experiment.py.
+# Rebuttal experiments (see src/layer_location_experiment.py):
+#   location : STUDE's dev-selected band vs early / late / random contiguous /
+#              random scattered layers, matched budgets            (requirement 2)
+#   ablation : original, pruning only, selected layers with/without pruning,
+#              all layers with/without pruning                     (requirement 3)
+# Both are planned by default; restrict with EXPERIMENTS="location" or "ablation".
 #
 # Run inside an HPC GPU allocation from an activated environment:
 #   bash layer_location.sh OUT_DIR prep          # split + dev band selection + plan
@@ -16,6 +20,7 @@ cd "$(dirname "$0")"
 OUT="${1:?Usage: bash layer_location.sh OUT_DIR prep|train INDEX|train-all|summarize}"
 STAGE="${2:?missing stage}"
 MODEL="${MODEL:-EleutherAI/pythia-2.8b}"
+EXPERIMENTS="${EXPERIMENTS:-location ablation}"
 PY="python3 -u src/layer_location_experiment.py"
 mkdir -p "$OUT/logs"
 
@@ -26,7 +31,8 @@ case "$STAGE" in
         --prune-ratio 0.10 --out "$OUT/band.json" 2>&1 | tee "$OUT/logs/select-band.log"
     $PY plan --band "$OUT/band.json" --splits "$OUT/splits.json" --paper-band 10 24 \
         --random-draws 3 --seeds 0 1 2 --lrs 1e-5 2e-5 4e-5 --kl-weights 0.7 \
-        --epochs 4 --grad-accum 32 --budget-mult 1.5 --out "$OUT/plan.json" \
+        --epochs 4 --grad-accum 32 --budget-mult 1.5 --experiments $EXPERIMENTS \
+        --out "$OUT/plan.json" \
         | tee "$OUT/logs/plan.log"
     ;;
   train)

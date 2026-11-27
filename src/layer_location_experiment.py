@@ -181,35 +181,47 @@ def cmd_select_band(args):
 
 def cmd_plan(args):
     band = read_json(args.band)
-    n, w = band["n_layers"], band["width"]
-    named = {"selected": band["selected_layers"]}
-    if args.paper_band:
-        lo, hi = args.paper_band
-        if hi - lo + 1 != w:
-            raise ValueError("paper band width must equal --width used in select-band")
-        named["paper_band"] = list(range(lo, hi + 1))
-    named.update(early=list(range(w)), late=list(range(n - w, n)))
-    # Identical layer sets are trained once; the later name is reported as an alias.
+    n, w, ratio = band["n_layers"], band["width"], band["prune_ratio"]
+    selected = band["selected_layers"]
+    named = []          # (arm, layers, prune_ratio), fixed order = alias priority
+    if "location" in args.experiments:
+        named.append(("selected", selected, ratio))
+        if args.paper_band:
+            lo, hi = args.paper_band
+            if hi - lo + 1 != w:
+                raise ValueError("paper band width must equal --width used in select-band")
+            named.append(("paper_band", list(range(lo, hi + 1)), ratio))
+        named += [("early", list(range(w)), ratio), ("late", list(range(n - w, n)), ratio)]
+    if "ablation" in args.experiments:
+        # Pruning vs targeted updates. "original" and "pruning_only" need no
+        # training: they are the epoch-0 measurements of the no-prune / pruned runs.
+        named += [("selected", selected, ratio), ("selected_noprune", selected, 0.0),
+                  ("all_layers", list(range(n)), ratio), ("all_layers_noprune", list(range(n)), 0.0)]
+    # Identical (layers, pruning) settings are trained once; later names become aliases.
     arms, aliases = [], {}
-    for name, layers in named.items():
-        twin = next((a["arm"] for a in arms if a["layers"] == layers), None)
+    for name, layers, pr in named:
+        if any(a["arm"] == name for a in arms):
+            continue
+        twin = next((a["arm"] for a in arms if a["layers"] == layers and a["prune_ratio"] == pr), None)
         if twin:
             aliases[name] = twin
         else:
-            arms.append({"arm": name, "draw": 0, "layers": layers})
+            arms.append({"arm": name, "draw": 0, "layers": layers, "prune_ratio": pr})
 
-    used_starts = {v[0] for v in named.values() if v == list(range(v[0], v[0] + w))}
-    starts = [s for s in range(n - w + 1) if s not in used_starts]
-    rng = random.Random(args.draw_seed)
-    for d, s in enumerate(rng.sample(starts, min(args.random_draws, len(starts)))):
-        arms.append({"arm": "random_contiguous", "draw": d, "layers": list(range(s, s + w))})
-    d = 0
-    while d < args.random_draws:
-        layers = sorted(rng.sample(range(n), w))
-        if layers == list(range(layers[0], layers[0] + w)):
-            continue  # contiguous by chance; scattered arm must not be a band
-        arms.append({"arm": "random_scattered", "draw": d, "layers": layers})
-        d += 1
+    if "location" in args.experiments:
+        used_starts = {l[0] for _, l, _ in named if len(l) == w and l == list(range(l[0], l[0] + w))}
+        starts = [s for s in range(n - w + 1) if s not in used_starts]
+        rng = random.Random(args.draw_seed)
+        for d, s in enumerate(rng.sample(starts, min(args.random_draws, len(starts)))):
+            arms.append({"arm": "random_contiguous", "draw": d, "layers": list(range(s, s + w)),
+                         "prune_ratio": ratio})
+        d = 0
+        while d < args.random_draws:
+            layers = sorted(rng.sample(range(n), w))
+            if layers == list(range(layers[0], layers[0] + w)):
+                continue  # contiguous by chance; scattered arm must not be a band
+            arms.append({"arm": "random_scattered", "draw": d, "layers": layers, "prune_ratio": ratio})
+            d += 1
 
     runs = []
     for arm in arms:
@@ -219,17 +231,23 @@ def cmd_plan(args):
                     rid = f"{arm['arm']}-d{arm['draw']}__s{seed}__lr{lr:g}_kl{kl:g}"
                     runs.append(dict(arm, run_id=rid, seed=seed, lr=lr, kl_weight=kl))
     plan = {"band": str(Path(args.band).resolve()), "splits": str(Path(args.splits).resolve()),
-            "model": band["model"], "width": w, "prune_ratio": band["prune_ratio"],
+            "model": band["model"], "width": w, "prune_ratio": ratio, "experiments": args.experiments,
             "epochs": args.epochs, "grad_accum": args.grad_accum, "max_length": band["max_length"],
             "budget_mult": args.budget_mult, "tuning_grid": {"lr": args.lrs, "kl_weight": args.kl_weights},
             "seeds": args.seeds, "arms": arms, "aliases": aliases, "runs": runs}
     write_json(args.out, plan)
-    print(f"{len(arms)} layer sets x {len(args.seeds)} seeds x "
+    print(f"{len(arms)} arms x {len(args.seeds)} seeds x "
           f"{len(args.lrs) * len(args.kl_weights)} grid points = {len(runs)} runs")
     for a in arms:
-        print(f"  {a['arm']:<18} draw {a['draw']}: {a['layers']}")
+        print(f"  {a['arm']:<20} draw {a['draw']} prune {a['prune_ratio']:.2f}: {a['layers']}")
     for name, twin in aliases.items():
-        print(f"  {name:<18} = same layers as {twin} (not trained twice)")
+        print(f"  {name:<20} = same setting as {twin} (not trained twice)")
+    first = {}
+    for i, r in enumerate(runs):
+        first.setdefault(r["arm"], []).append(i)
+    print("Run indices per arm (for `train --index`):")
+    for arm, idx in first.items():
+        print(f"  {arm:<20} {idx[0]}-{idx[-1]}")
 
 
 # ── Stage 4: train one run ────────────────────────────────────────────────────
@@ -263,8 +281,12 @@ def cmd_train(args):
     print(f"Run {args.index}: {run['run_id']} layers={run['layers']}", flush=True)
 
     model, tok = load_lm(plan["model"], dtype="bfloat16")   # matches train_model.py
-    prune_l1_unstructured(model, prune_ratio=plan["prune_ratio"], layer_start=0)
-    pruning_masks = {n: (p.data == 0).clone() for n, p in model.named_parameters() if (p.data == 0).any()}
+    prune_ratio = run.get("prune_ratio", plan["prune_ratio"])
+    if prune_ratio > 0:
+        prune_l1_unstructured(model, prune_ratio=prune_ratio, layer_start=0)
+        pruning_masks = {n: (p.data == 0).clone() for n, p in model.named_parameters() if (p.data == 0).any()}
+    else:
+        pruning_masks = {}   # no-pruning arms: nothing is held at zero
 
     per_layer = {}
     for name, p in model.named_parameters():
@@ -312,7 +334,7 @@ def cmd_train(args):
               f"(budget {budget:.2f}) | test AUC {rec['test_panel']['roc_auc']:.4f}", flush=True)
         return rec
 
-    history = [measure(0, {"note": "pruned, before unlearning"})]
+    history = [measure(0, {"note": "before unlearning" + (" (pruned)" if prune_ratio > 0 else " (unpruned)")})]
     optimizer_steps, best_gap = 0, None
     for epoch in range(epochs):
         order = list(forget)
@@ -359,81 +381,140 @@ def cmd_train(args):
 
 # ── Stage 5: summarize ────────────────────────────────────────────────────────
 
+ORDER = ["original_bf16", "pruning_only", "selected_noprune", "selected", "all_layers_noprune",
+         "all_layers", "paper_band", "early", "late", "random_contiguous", "random_scattered"]
+METRICS = ["test_auc", "test_gap", "rho", "test_mk_gap", "test_ppl_auc", "test_lowercase_auc",
+           "test_zlib_auc", "utility_test_ppl"]
+# (name, treatment arm, control arm): paired per seed, differences = treatment - control.
+CONTRASTS = [("pruning adds value: selected layers", "selected", "selected_noprune"),
+             ("pruning adds value: all layers", "all_layers", "all_layers_noprune"),
+             ("restricting updates: with pruning", "selected", "all_layers"),
+             ("restricting updates: without pruning", "selected_noprune", "all_layers_noprune")]
+
+
+def test_row(record, base_auc):
+    t = record["test_panel"]
+    gap = abs(t["roc_auc"] - 0.5)
+    return {"test_auc": t["roc_auc"], "test_gap": gap, "rho": 1 - gap / abs(base_auc - 0.5),
+            "test_mk_gap": t["mink_gap"], "test_ppl_auc": t["ppl_auc"],
+            "test_lowercase_auc": t["lowercase_auc"], "test_zlib_auc": t["zlib_auc"],
+            "utility_test_ppl": record["utility_test_ppl"]}
+
+
 def cmd_summarize(args):
     import numpy as np
     plan = read_json(args.plan)
     band = read_json(plan["band"])
     original = band["original"]
-    base_auc = original["test_panel"]["roc_auc"]
+    base_auc = original["test_panel"]["roc_auc"]   # fp32 original: rho denominator for every row
     budget = plan["budget_mult"] * original["utility_dev_ppl"]
     runs_dir = Path(args.out) / "runs"
 
-    # Per (arm, draw, seed): pick grid point + epoch by DEV only, report TEST.
-    groups, missing = {}, []
+    groups, missing, tradeoff, untrained = {}, [], [], {}
     for run in plan["runs"]:
         path = runs_dir / run["run_id"] / "result.json"
         if not path.exists():
             missing.append(run["run_id"])
             continue
         res = read_json(path)
+        # Epoch 0 = no unlearning; identical across seeds/lrs (pruning is deterministic).
+        pr = run.get("prune_ratio", plan["prune_ratio"])
+        untrained.setdefault("pruning_only" if pr > 0 else "original_bf16",
+                             dict(test_row(res["history"][0], base_auc), source_run=run["run_id"],
+                                  trainable_parameters=0))
+        for e in res["history"][1:]:
+            tradeoff.append({"arm": run["arm"], "draw": run["draw"], "seed": run["seed"], "lr": run["lr"],
+                             "kl_weight": run["kl_weight"], "epoch": e["epoch"],
+                             "dev_mink_auc": e["dev_mink_auc"], "utility_dev_ppl": e["utility_dev_ppl"],
+                             **test_row(e, base_auc)})
         choice = dev_choice(res["history"], budget)
         key = (run["arm"], run["draw"], run["seed"])
         groups.setdefault(key, [])
         if choice is not None:
             groups[key].append((abs(choice["dev_mink_auc"] - 0.5), run, choice, res["trainable_parameters"]))
-    selections, params = [], set()
+
+    # Per (arm, draw, seed): grid point + epoch chosen on DEV only; TEST reported.
+    selections = []
     for (arm, draw, seed), cands in sorted(groups.items()):
         if not cands:
             selections.append({"arm": arm, "draw": draw, "seed": seed, "status": "no_in_budget_config"})
             continue
         _, run, ch, n_params = min(cands, key=lambda c: (c[0], c[1]["lr"], c[1]["kl_weight"]))
-        params.add(n_params)
-        t = ch["test_panel"]
-        gap = abs(t["roc_auc"] - 0.5)
         selections.append({"arm": arm, "draw": draw, "seed": seed, "status": "ok", "layers": run["layers"],
-                           "lr": run["lr"], "kl_weight": run["kl_weight"], "epoch": ch["epoch"],
-                           "dev_mink_auc": ch["dev_mink_auc"], "test_auc": t["roc_auc"], "test_gap": gap,
-                           "rho": 1 - gap / abs(base_auc - 0.5), "test_mk_gap": t["mink_gap"],
-                           "test_ppl_auc": t["ppl_auc"], "test_lowercase_auc": t["lowercase_auc"],
-                           "test_zlib_auc": t["zlib_auc"], "utility_test_ppl": ch["utility_test_ppl"],
-                           "trainable_parameters": n_params})
-    metrics = ["test_auc", "test_gap", "rho", "test_mk_gap", "test_ppl_auc", "test_lowercase_auc",
-               "test_zlib_auc", "utility_test_ppl"]
-    order = ["selected", "paper_band", "early", "late", "random_contiguous", "random_scattered"]
+                           "prune_ratio": run.get("prune_ratio", plan["prune_ratio"]), "lr": run["lr"],
+                           "kl_weight": run["kl_weight"], "epoch": ch["epoch"],
+                           "dev_mink_auc": ch["dev_mink_auc"], "trainable_parameters": n_params,
+                           **test_row(ch, base_auc)})
+
+    def stats(vals):
+        return {"mean": float(np.mean(vals)) if vals else None,
+                "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else None}
+
     table = {}
-    for arm in [a for a in order if any(s["arm"] == a for s in selections)]:
-        ok = [s for s in selections if s["arm"] == arm and s["status"] == "ok"]
-        table[arm] = {"n_ok": len(ok), "n_failed": sum(1 for s in selections if s["arm"] == arm) - len(ok)}
-        for m in metrics:
-            vals = [s[m] for s in ok]
-            table[arm][m] = {"mean": float(np.mean(vals)) if vals else None,
-                             "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else None}
+    for arm, row in untrained.items():
+        table[arm] = dict({m: {"mean": row[m], "std": None} for m in METRICS}, n_ok=1, n_failed=0,
+                          trainable_parameters=[0], note=f"epoch 0 of {row['source_run']}")
+    for arm in {s["arm"] for s in selections}:
+        mine = [s for s in selections if s["arm"] == arm]
+        ok = [s for s in mine if s["status"] == "ok"]
+        table[arm] = dict({m: stats([s[m] for s in ok]) for m in METRICS}, n_ok=len(ok),
+                          n_failed=len(mine) - len(ok),
+                          trainable_parameters=sorted({s["trainable_parameters"] for s in ok}))
     for name, twin in plan.get("aliases", {}).items():
         if twin in table:
             table[name] = dict(table[twin], alias_of=twin)
-    table = {a: table[a] for a in order if a in table}
-    summary = {"original_test_auc": base_auc, "original_utility_test_ppl": original["utility_test_ppl"],
-               "dev_utility_budget_ppl": budget, "selected_band": band["selected_layers"],
-               "trainable_parameters_per_run": sorted(params), "matched_parameter_budget": len(params) <= 1,
-               "missing_runs": missing, "per_arm": table, "selections": selections}
-    write_json(Path(args.out) / "summary.json", summary)
+    table = {a: table[a] for a in ORDER if a in table}
 
-    def fmt(cell):
+    location_arms = ["selected", "paper_band", "early", "late", "random_contiguous", "random_scattered"]
+    location_params = sorted({p for a in location_arms if a in table and not table[a].get("alias_of")
+                              for p in table[a]["trainable_parameters"]})
+
+    contrasts = {}
+    for name, treat, ctrl in CONTRASTS:
+        treat, ctrl = plan.get("aliases", {}).get(treat, treat), plan.get("aliases", {}).get(ctrl, ctrl)
+        by_seed = lambda arm: {s["seed"]: s for s in selections if s["arm"] == arm and s["status"] == "ok"}
+        a, b = by_seed(treat), by_seed(ctrl)
+        seeds = sorted(set(a) & set(b))
+        if seeds:
+            contrasts[name] = dict({m: stats([a[k][m] - b[k][m] for k in seeds])
+                                    for m in ("test_gap", "rho", "utility_test_ppl")}, seeds=seeds)
+
+    summary = {"original_fp32_test_auc": base_auc, "original_fp32_utility_test_ppl": original["utility_test_ppl"],
+               "dev_utility_budget_ppl": budget, "selected_band": band["selected_layers"],
+               "location_trainable_parameters": location_params,
+               "location_parameter_budget_matched": len(location_params) <= 1,
+               "missing_runs": missing, "per_arm": table, "paired_contrasts": contrasts,
+               "selections": selections}
+    write_json(Path(args.out) / "summary.json", summary)
+    write_json(Path(args.out) / "tradeoff.json", tradeoff)
+
+    def fmt(cell, digits=3):
         if cell["mean"] is None:
             return "n/a"
-        return f"{cell['mean']:.3f}" + (f" ± {cell['std']:.3f}" if cell["std"] is not None else "")
-    lines = [f"Selected band (dev): {band['selected_layers']}  |  original test AUC {base_auc:.3f}, "
-             f"test PPL {original['utility_test_ppl']:.2f}  |  trainable params/run: {sorted(params)}", "",
-             "| Arm | n | Test AUC | ρ (gap closed) | MK-Gap | PPL-AUC | Lowercase | Zlib | Test PPL |",
-             "|---|---|---|---|---|---|---|---|---|"]
+        return f"{cell['mean']:.{digits}f}" + (f" ± {cell['std']:.{digits}f}" if cell["std"] is not None else "")
+    lines = [f"Selected band (dev): {band['selected_layers']}  |  original (fp32) test AUC {base_auc:.3f}, "
+             f"test PPL {original['utility_test_ppl']:.2f}  |  dev utility budget {budget:.2f}", "",
+             "| Arm | n | Trainable params | Test AUC | ρ (gap closed) | MK-Gap | PPL-AUC | Lowercase | Zlib | Test PPL |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for arm, row in table.items():
         label = arm + (f" (= {row['alias_of']})" if row.get("alias_of") else "")
-        lines.append(f"| {label} | {row['n_ok']}" + (f" (+{row['n_failed']} over budget)" if row["n_failed"] else "")
-                     + " | " + " | ".join(fmt(row[m]) for m in
-                                          ["test_auc", "rho", "test_mk_gap", "test_ppl_auc",
-                                           "test_lowercase_auc", "test_zlib_auc", "utility_test_ppl"]) + " |")
+        n = f"{row['n_ok']}" + (f" (+{row['n_failed']} over budget)" if row["n_failed"] else "")
+        params = ", ".join(f"{p:,}" for p in row["trainable_parameters"]) or "n/a"
+        lines.append(f"| {label} | {n} | {params} | " + " | ".join(
+            fmt(row[m]) for m in ["test_auc", "rho", "test_mk_gap", "test_ppl_auc",
+                                  "test_lowercase_auc", "test_zlib_auc", "utility_test_ppl"]) + " |")
+    if contrasts:
+        lines += ["", "Paired differences per seed (treatment − control; lower test gap / PPL is better):", "",
+                  "| Contrast | seeds | Δ test gap | Δ ρ | Δ test PPL |", "|---|---|---|---|---|"]
+        for name, c in contrasts.items():
+            lines.append(f"| {name} | {len(c['seeds'])} | {fmt(c['test_gap'], 4)} | {fmt(c['rho'])} | "
+                         f"{fmt(c['utility_test_ppl'], 2)} |")
+    if not summary["location_parameter_budget_matched"]:
+        lines += ["", f"WARNING: location arms have unequal trainable parameters: {location_params}"]
     if missing:
         lines += ["", f"WARNING: {len(missing)} planned runs have no result yet."]
+    lines += ["", "Every (epoch, lr) point with test gap and test PPL is in tradeoff.json "
+                  "(descriptive frontier; selection above used dev only)."]
     (Path(args.out) / "summary.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
@@ -473,6 +554,10 @@ def main():
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--grad-accum", type=int, default=32)
     p.add_argument("--budget-mult", type=float, default=1.5)
+    p.add_argument("--experiments", nargs="+", choices=("location", "ablation"),
+                   default=["location", "ablation"],
+                   help="location = band vs early/late/random layers; "
+                        "ablation = pruning vs targeted updates (requirement 3)")
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_plan)
 
